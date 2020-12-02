@@ -193,33 +193,49 @@ impl Butterfly4
     }
 }
 impl<T: FFTnum> FFTButterfly<T> for Butterfly4 {
+//    #[inline(always)]
+//    unsafe fn process_inplace(&self, buffer: &mut [Complex<T>]) {
+//        let butterfly2 = Butterfly2::new(self.inverse);
+//
+//        //we're going to hardcode a step of mixed radix
+//        //aka we're going to do the six step algorithm
+//
+//        // step 1: transpose, which we're skipping because we're just going to perform non-contiguous FFTs
+//
+//        // step 2: column FFTs
+//        {
+//            let (a, b) = buffer.split_at_mut(2);
+//            Butterfly2::perform_fft_direct(a.get_unchecked_mut(0), b.get_unchecked_mut(0));
+//            Butterfly2::perform_fft_direct(a.get_unchecked_mut(1), b.get_unchecked_mut(1));
+//
+//            // step 3: apply twiddle factors (only one in this case, and it's either 0 + i or 0 - i)
+//            *b.get_unchecked_mut(1) = twiddles::rotate_90(*b.get_unchecked(1), self.inverse);
+//
+//            // step 4: transpose, which we're skipping because we're the previous FFTs were non-contiguous
+//
+//            // step 5: row FFTs
+//            butterfly2.process_inplace(a);
+//            butterfly2.process_inplace(b);
+//        }
+//
+//        // step 6: transpose
+//        swap_unchecked(buffer, 1, 2);
+//    }
     #[inline(always)]
     unsafe fn process_inplace(&self, buffer: &mut [Complex<T>]) {
-        let butterfly2 = Butterfly2::new(self.inverse);
-
-        //we're going to hardcode a step of mixed radix
-        //aka we're going to do the six step algorithm
-
-        // step 1: transpose, which we're skipping because we're just going to perform non-contiguous FFTs
-
-        // step 2: column FFTs
-        {
-            let (a, b) = buffer.split_at_mut(2);
-            Butterfly2::perform_fft_direct(a.get_unchecked_mut(0), b.get_unchecked_mut(0));
-            Butterfly2::perform_fft_direct(a.get_unchecked_mut(1), b.get_unchecked_mut(1));
-
-            // step 3: apply twiddle factors (only one in this case, and it's either 0 + i or 0 - i)
-            *b.get_unchecked_mut(1) = twiddles::rotate_90(*b.get_unchecked(1), self.inverse);
-
-            // step 4: transpose, which we're skipping because we're the previous FFTs were non-contiguous
-
-            // step 5: row FFTs
-            butterfly2.process_inplace(a);
-            butterfly2.process_inplace(b);
+        let temp02p = *buffer.get_unchecked(0) + *buffer.get_unchecked(2);
+        let temp02n = *buffer.get_unchecked(0) - *buffer.get_unchecked(2);
+        let temp13p = *buffer.get_unchecked(1) + *buffer.get_unchecked(3);
+        let temp13r = Complex{re: buffer.get_unchecked(1).im - buffer.get_unchecked(3).im, im: -buffer.get_unchecked(1).re +buffer.get_unchecked(3).re };
+        *buffer.get_unchecked_mut(0) = temp02p + temp13p;
+        *buffer.get_unchecked_mut(2) = temp02p - temp13p;
+        if self.inverse {
+            *buffer.get_unchecked_mut(1) = temp02n - temp13r;
+            *buffer.get_unchecked_mut(3) = temp02n + temp13r;
+        } else {
+            *buffer.get_unchecked_mut(1) = temp02n + temp13r;
+            *buffer.get_unchecked_mut(3) = temp02n - temp13r;
         }
-
-        // step 6: transpose
-        swap_unchecked(buffer, 1, 2);
     }
     #[inline(always)]
     unsafe fn process_multi_inplace(&self, buffer: &mut [Complex<T>]) {
