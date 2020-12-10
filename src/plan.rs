@@ -203,7 +203,11 @@ impl<T: FFTnum> FFTplanner<T> {
             //neither size is a butterfly, so go with the normal algorithm
             let left_fft = Box::new(self.make_strategy_from_factors(left_len, left_factors));
             let right_fft = Box::new(self.make_strategy_from_factors(right_len, right_factors));
-            Strategy::MixedRadix{left_fft, right_fft}
+            //if gcd(left_len, right_len) == 1 {
+            //    Strategy::GoodThomas{left_fft, right_fft}
+            //} else {
+                Strategy::MixedRadix{left_fft, right_fft}
+            //}
         }
     }
 
