@@ -21,6 +21,13 @@ fn bench_fft(b: &mut Bencher, len: usize) {
     b.iter(|| {fft.process(&mut signal, &mut spectrum);} );
 }
 
+// Small powers of 2
+#[bench] fn complex_p2_00000002(b: &mut Bencher) { bench_fft(b,       2); }
+#[bench] fn complex_p2_00000004(b: &mut Bencher) { bench_fft(b,       4); }
+#[bench] fn complex_p2_00000008(b: &mut Bencher) { bench_fft(b,       8); }
+#[bench] fn complex_p2_00000016(b: &mut Bencher) { bench_fft(b,      16); }
+#[bench] fn complex_p2_00000032(b: &mut Bencher) { bench_fft(b,      32); }
+
 
 // Powers of 4
 #[bench] fn complex_p2_00000064(b: &mut Bencher) { bench_fft(b,       64); }
