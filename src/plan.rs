@@ -87,7 +87,14 @@ macro_rules! butterfly {
             6 => Arc::new(Butterfly6::new($inverse)),
             7 => Arc::new(Butterfly7::new($inverse)),
             8 => Arc::new(Butterfly8::new($inverse)),
+            11 => Arc::new(Butterfly11::new($inverse)),
+            13 => Arc::new(Butterfly13::new($inverse)),
             16 => Arc::new(Butterfly16::new($inverse)),
+            17 => Arc::new(Butterfly17::new($inverse)),
+            19 => Arc::new(Butterfly19::new($inverse)),
+            23 => Arc::new(Butterfly23::new($inverse)),
+            29 => Arc::new(Butterfly29::new($inverse)),
+            31 => Arc::new(Butterfly31::new($inverse)),
             32 => Arc::new(Butterfly32::new($inverse)),
             _ => panic!("Invalid butterfly size: {}", $len),
         }
@@ -448,7 +455,7 @@ mod unit_tests {
 
     #[test]
     fn test_plan_bluestein() {
-        let primes: [usize; 6] = [89, 179, 359, 719, 1439, 2879];
+        let primes: [usize; 5] = [179, 359, 719, 1439, 2879];
 
         let mut planner = FFTplanner::<f64>::new(false);
         for len in primes.iter() {
