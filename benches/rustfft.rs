@@ -21,6 +21,13 @@ fn bench_fft(b: &mut Bencher, len: usize) {
     b.iter(|| {fft.process(&mut signal, &mut spectrum);} );
 }
 
+// Small powers of 2
+#[bench] fn complex_p2_00000002(b: &mut Bencher) { bench_fft(b,       2); }
+#[bench] fn complex_p2_00000004(b: &mut Bencher) { bench_fft(b,       4); }
+#[bench] fn complex_p2_00000008(b: &mut Bencher) { bench_fft(b,       8); }
+#[bench] fn complex_p2_00000016(b: &mut Bencher) { bench_fft(b,      16); }
+#[bench] fn complex_p2_00000032(b: &mut Bencher) { bench_fft(b,      32); }
+
 
 // Powers of 4
 #[bench] fn complex_p2_00000064(b: &mut Bencher) { bench_fft(b,       64); }
@@ -39,6 +46,7 @@ fn bench_fft(b: &mut Bencher, len: usize) {
 #[bench] fn complex_p7_16807(b: &mut Bencher) { bench_fft(b, 16807); }
 
 // Prime lengths
+#[bench] fn complex_prime_00003(b: &mut Bencher) { bench_fft(b, 3); }
 #[bench] fn complex_prime_00005(b: &mut Bencher) { bench_fft(b, 5); }
 #[bench] fn complex_prime_00017(b: &mut Bencher) { bench_fft(b, 17); }
 #[bench] fn complex_prime_00151(b: &mut Bencher) { bench_fft(b, 151); }

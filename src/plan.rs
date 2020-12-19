@@ -11,16 +11,62 @@ use algorithm::butterflies::*;
 use math_utils;
 
 #[derive(Debug, std::cmp::PartialEq)]
-pub enum Strategy {
+pub enum Plan {
     DFT(usize),
-    MixedRadix { left_fft: Box<Strategy>, right_fft: Box<Strategy>},
-    GoodThomas { left_fft: Box<Strategy>, right_fft: Box<Strategy>},
+    MixedRadix { left_fft: Box<Plan>, right_fft: Box<Plan>},
+    GoodThomas { left_fft: Box<Plan>, right_fft: Box<Plan>},
     MixedRadixDoubleButterfly(usize, usize),
     GoodThomasDoubleButterfly(usize, usize),
-    Rader { len: usize, inner_fft: Box<Strategy>},
-    Bluestein { len: usize, inner_fft: Box<Strategy>},
+    Rader { len: usize, inner_fft: Box<Plan>},
+    Bluestein { len: usize, inner_fft: Box<Plan>},
     Radix4(usize),
     Butterfly(usize),
+}
+
+impl Plan {
+    pub fn len(&self) -> usize {
+        match self {
+            Plan::DFT(len) => *len,
+            Plan::Radix4(len) => *len,
+            Plan::Butterfly(len) => *len,
+            Plan::MixedRadix { left_fft, right_fft } => left_fft.len() * right_fft.len(),
+            Plan::GoodThomas { left_fft, right_fft } => left_fft.len() * right_fft.len(),
+            Plan::MixedRadixDoubleButterfly(left_len, right_len) => *left_len * *right_len,
+            Plan::GoodThomasDoubleButterfly(left_len, right_len) => *left_len * *right_len,
+            Plan::Rader { len, .. } => *len,
+            Plan::Bluestein { len , .. } => *len,
+        }
+    }
+
+    pub fn cost(&self) -> usize {
+        match self {
+            Plan::DFT(len) => 4*len.pow(2),
+            Plan::Radix4(len) => 2*len*((*len as f32).ln().round() as usize),
+            Plan::Butterfly(len) => len*((*len as f32).ln().round() as usize),
+            Plan::MixedRadix { left_fft, right_fft } => {
+                let left_cost = left_fft.cost();
+                let right_cost = right_fft.cost();
+                left_cost*right_fft.len() + right_cost*left_fft.len()
+            },
+            Plan::GoodThomas { left_fft, right_fft } => {
+                let left_cost = left_fft.cost();
+                let right_cost = right_fft.cost();
+                left_cost*right_fft.len() + right_cost*left_fft.len()
+            },
+            Plan::MixedRadixDoubleButterfly(left_len, right_len) => {
+                let left_cost = left_len*((*left_len as f32).ln().round() as usize);
+                let right_cost = left_len*((*left_len as f32).ln().round() as usize);
+                left_len*right_cost + right_len*left_cost
+            },
+            Plan::GoodThomasDoubleButterfly(left_len, right_len) => {
+                let left_cost = left_len*((*left_len as f32).ln().round() as usize);
+                let right_cost = left_len*((*left_len as f32).ln().round() as usize);
+                left_len*right_cost + right_len*left_cost
+            },
+            Plan::Rader { len, inner_fft } => *len + 2*inner_fft.cost(),
+            Plan::Bluestein { len , inner_fft } =>  *len + 2*inner_fft.cost(),
+        }
+    }
 }
 
 const MIN_RADIX4_BITS: u32 = 5; // smallest size to consider radix 4 an option is 2^5 = 32
@@ -103,44 +149,44 @@ impl<T: FFTnum> FFTplanner<T> {
         } else if self.algorithm_cache.contains_key(&len) {
             Arc::clone(self.algorithm_cache.get(&len).unwrap())
         } else {
-            let plan = self.make_strategy_for_len(len);
+            let plan = self.make_plan_for_len(len);
             let fft = self.construct_fft(plan);
             self.algorithm_cache.insert(len, Arc::clone(&fft));
             fft
         }
     }
 
-    // Make a strategy for a length
-    fn make_strategy_for_len(&mut self, len: usize) -> Strategy {
+    // Make a plan for a length
+    fn make_plan_for_len(&mut self, len: usize) -> Plan {
         if len < 2 {
-            Strategy::DFT(len)
+            Plan::DFT(len)
         } else {    
             let factors = math_utils::prime_factors(len);
-            self.make_strategy_from_factors(len, &factors)
+            self.make_plan_from_factors(len, &factors)
         }
     }
 
-    // Make a strategy for the given prime factors
-    fn make_strategy_from_factors(&mut self, len: usize, factors: &[usize]) -> Strategy {
+    // Make a plan for the given prime factors
+    fn make_plan_from_factors(&mut self, len: usize, factors: &[usize]) -> Plan {
         if factors.len() == 1 || COMPOSITE_BUTTERFLIES.contains(&len) {
             //the length is either a prime or matches a butterfly
-            self.make_strategy_for_single_factor(len)
+            self.make_plan_for_single_factor(len)
         } else if len.trailing_zeros() <= MAX_RADIX4_BITS && len.trailing_zeros() >= MIN_RADIX4_BITS && len.is_power_of_two(){
             //the length is a power of two in the range where Radix4 is the fastest option.
-            Strategy::Radix4(len)
+            Plan::Radix4(len)
         } else {
-            self.make_strategy_for_mixed_radix(len, &factors)
+            self.make_plan_for_mixed_radix(len, &factors)
         }
     }
 
-    fn make_strategy_for_mixed_radix(&mut self, len: usize, factors: &[usize]) -> Strategy {
+    fn make_plan_for_mixed_radix(&mut self, len: usize, factors: &[usize]) -> Plan {
         if len.trailing_zeros() <= MAX_RADIX4_BITS && len.trailing_zeros() >= MIN_RADIX4_BITS {
             //the number of trailing zeroes in len is the number of `2` factors
             //ie if len = 2048 * n, len.trailing_zeros() will equal 11 because 2^11 == 2048
             let left_len = 1 << len.trailing_zeros();
             let right_len = len / left_len;
             let (left_factors, right_factors) = factors.split_at(len.trailing_zeros() as usize);
-            self.make_strategy_for_mixed_radix_from_factor_lists(left_len, left_factors, right_len, right_factors)
+            self.make_plan_for_mixed_radix_from_factor_lists(left_len, left_factors, right_len, right_factors)
         } else {
             let sqrt = (len as f32).sqrt() as usize;
             if sqrt * sqrt == len {
@@ -151,7 +197,7 @@ impl<T: FFTnum> FFTplanner<T> {
                 for chunk in factors.chunks(2) {
                     sqrt_factors.push(chunk[0]);
                 }
-                self.make_strategy_for_mixed_radix_from_factor_lists(sqrt, &sqrt_factors, sqrt, &sqrt_factors)
+                self.make_plan_for_mixed_radix_from_factor_lists(sqrt, &sqrt_factors, sqrt, &sqrt_factors)
             } else {
                 //len isn't a perfect square. greedily take factors from the list until both sides are as close as possible to sqrt(len)
                 //TODO: We can probably make this more optimal by using a more sophisticated non-greedy algorithm
@@ -175,18 +221,18 @@ impl<T: FFTnum> FFTplanner<T> {
 
                 //we now have our two FFT sizes: product and product / len
                 let (left_factors, right_factors) = factors.split_at(second_half_index);
-                self.make_strategy_for_mixed_radix_from_factor_lists(product, left_factors, len / product, right_factors)
+                self.make_plan_for_mixed_radix_from_factor_lists(product, left_factors, len / product, right_factors)
             }
         }
     }
 
-    // Make a strategy using mixed radix
-    fn make_strategy_for_mixed_radix_from_factor_lists(&mut self,
+    // Make a plan using mixed radix
+    fn make_plan_for_mixed_radix_from_factor_lists(&mut self,
         left_len: usize,
         left_factors: &[usize],
         right_len: usize,
         right_factors: &[usize])
-        -> Strategy {
+        -> Plan {
 
         let left_is_butterfly = BUTTERFLIES.contains(&left_len);
         let right_is_butterfly = BUTTERFLIES.contains(&right_len);
@@ -195,33 +241,33 @@ impl<T: FFTnum> FFTplanner<T> {
         if left_is_butterfly && right_is_butterfly {            
             // for butterflies, if gcd is 1, we always want to use good-thomas
             if gcd(left_len, right_len) == 1 {
-                Strategy::GoodThomasDoubleButterfly(left_len, right_len)
+                Plan::GoodThomasDoubleButterfly(left_len, right_len)
             } else {
-                Strategy::MixedRadixDoubleButterfly(left_len, right_len)
+                Plan::MixedRadixDoubleButterfly(left_len, right_len)
             }
         } else {
             //neither size is a butterfly, so go with the normal algorithm
-            let left_fft = Box::new(self.make_strategy_from_factors(left_len, left_factors));
-            let right_fft = Box::new(self.make_strategy_from_factors(right_len, right_factors));
+            let left_fft = Box::new(self.make_plan_from_factors(left_len, left_factors));
+            let right_fft = Box::new(self.make_plan_from_factors(right_len, right_factors));
             //if gcd(left_len, right_len) == 1 {
-            //    Strategy::GoodThomas{left_fft, right_fft}
+            //    Plan::GoodThomas{left_fft, right_fft}
             //} else {
-                Strategy::MixedRadix{left_fft, right_fft}
+                Plan::MixedRadix{left_fft, right_fft}
             //}
         }
     }
 
-    // Make a strategy for a single factor
-    fn make_strategy_for_single_factor(&mut self, len: usize) -> Strategy {
+    // Make a plan for a single factor
+    fn make_plan_for_single_factor(&mut self, len: usize) -> Plan {
         match len {
-            0|1=> Strategy::DFT(len),
-            2|3|4|5|6|7|8|16|32 => Strategy::Butterfly(len),
-            _ => self.make_strategy_for_prime(len),
+            0|1=> Plan::DFT(len),
+            2|3|4|5|6|7|8|16|32 => Plan::Butterfly(len),
+            _ => self.make_plan_for_prime(len),
         }
     }
 
-    // Make a strategy for a prime factor
-    fn make_strategy_for_prime(&mut self, len: usize) -> Strategy {
+    // Make a plan for a prime factor
+    fn make_plan_for_prime(&mut self, len: usize) -> Plan {
         let inner_fft_len_rader = len - 1;
         let factors = math_utils::prime_factors(inner_fft_len_rader);
         // If any of the prime factors is too large, Rader's gets slow and Bluestein's is the better choice
@@ -232,52 +278,52 @@ impl<T: FFTnum> FFTplanner<T> {
             let mixed_radix_len = 3*inner_fft_len_pow2/4;
             let inner_fft = if mixed_radix_len >= min_inner_len && len >= MIN_BLUESTEIN_MIXED_RADIX_LEN {
                 let inner_factors = math_utils::prime_factors(mixed_radix_len);
-                self.make_strategy_from_factors(mixed_radix_len, &inner_factors)
+                self.make_plan_from_factors(mixed_radix_len, &inner_factors)
             }
             else {
-                Strategy::Radix4(inner_fft_len_pow2)
+                Plan::Radix4(inner_fft_len_pow2)
             };
-            Strategy::Bluestein{len, inner_fft: Box::new(inner_fft)}
+            Plan::Bluestein{len, inner_fft: Box::new(inner_fft)}
         }
         else {
-            let inner_fft = self.make_strategy_from_factors(inner_fft_len_rader, &factors);
-            Strategy::Rader{len, inner_fft: Box::new(inner_fft)}
+            let inner_fft = self.make_plan_from_factors(inner_fft_len_rader, &factors);
+            Plan::Rader{len, inner_fft: Box::new(inner_fft)}
         }
     }
 
-    // Create the fft from a strategy
-    fn construct_fft(&mut self, plan: Strategy) -> Arc<FFT<T>> {
+    // Create the fft from a plan
+    fn construct_fft(&mut self, plan: Plan) -> Arc<FFT<T>> {
         match plan {
-            Strategy::DFT(len) => Arc::new(DFT::new(len, self.inverse)) as Arc<FFT<T>>,
-            Strategy::Radix4(len) => Arc::new(Radix4::new(len, self.inverse)) as Arc<FFT<T>>,
-            Strategy::Butterfly(len) => {
+            Plan::DFT(len) => Arc::new(DFT::new(len, self.inverse)) as Arc<FFT<T>>,
+            Plan::Radix4(len) => Arc::new(Radix4::new(len, self.inverse)) as Arc<FFT<T>>,
+            Plan::Butterfly(len) => {
                 butterfly!(len, self.inverse)
             }
-            Strategy::MixedRadix { left_fft, right_fft } => {
+            Plan::MixedRadix { left_fft, right_fft } => {
                 let left_fft = self.construct_fft(*left_fft);
                 let right_fft = self.construct_fft(*right_fft);
                 Arc::new(MixedRadix::new(left_fft, right_fft)) as Arc<FFT<T>>
             },
-            Strategy::GoodThomas { left_fft, right_fft } => {
+            Plan::GoodThomas { left_fft, right_fft } => {
                 let left_fft = self.construct_fft(*left_fft);
                 let right_fft = self.construct_fft(*right_fft);
                 Arc::new(GoodThomasAlgorithm::new(left_fft, right_fft)) as Arc<FFT<T>>
             },
-            Strategy::MixedRadixDoubleButterfly(left_len, right_len) => {
+            Plan::MixedRadixDoubleButterfly(left_len, right_len) => {
                 let left_fft = self.construct_butterfly(left_len);
                 let right_fft = self.construct_butterfly(right_len);
                 Arc::new(MixedRadixDoubleButterfly::new(left_fft, right_fft)) as Arc<FFT<T>>
             },
-            Strategy::GoodThomasDoubleButterfly(left_len, right_len) => {
+            Plan::GoodThomasDoubleButterfly(left_len, right_len) => {
                 let left_fft = self.construct_butterfly(left_len);
                 let right_fft = self.construct_butterfly(right_len);
                 Arc::new(GoodThomasAlgorithmDoubleButterfly::new(left_fft, right_fft)) as Arc<FFT<T>>
             },
-            Strategy::Rader { len, inner_fft } => {
+            Plan::Rader { len, inner_fft } => {
                 let inner_fft = self.construct_fft(*inner_fft);
                 Arc::new(RadersAlgorithm::new(len, inner_fft)) as Arc<FFT<T>>
             },
-            Strategy::Bluestein { len , inner_fft } => {
+            Plan::Bluestein { len , inner_fft } => {
                 let inner_fft = self.construct_fft(*inner_fft);
                 Arc::new(Bluesteins::new(len, inner_fft)) as Arc<FFT<T>>
             },
@@ -305,8 +351,8 @@ mod unit_tests {
         // Length 0 and 1 should use DFT
         let mut planner = FFTplanner::<f64>::new(false);
         for len in 0..2 {
-            let plan = planner.make_strategy_for_len(len);
-            assert_eq!(plan, Strategy::DFT(len));
+            let plan = planner.make_plan_for_len(len);
+            assert_eq!(plan, Plan::DFT(len));
         }
     }
 
@@ -316,8 +362,8 @@ mod unit_tests {
         let mut planner = FFTplanner::<f64>::new(false);
         for pow in 6..16 {
             let len = 1 << pow;
-            let plan = planner.make_strategy_for_len(len);
-            assert_eq!(plan, Strategy::Radix4(len));
+            let plan = planner.make_plan_for_len(len);
+            assert_eq!(plan, Plan::Radix4(len));
         }
     }
 
@@ -327,7 +373,7 @@ mod unit_tests {
         let mut planner = FFTplanner::<f64>::new(false);
         for pow in 17..32 {
             let len = 1 << pow;
-            let plan = planner.make_strategy_for_len(len);
+            let plan = planner.make_plan_for_len(len);
             assert!(is_mixedradix(&plan), "Expected MixedRadix, got {:?}", plan);
         }
     }
@@ -337,8 +383,8 @@ mod unit_tests {
         // Check that all butterflies are used
         let mut planner = FFTplanner::<f64>::new(false);
         for len in [2,3,4,5,6,7,8,16,32].iter() {
-            let plan = planner.make_strategy_for_len(*len);
-            assert_eq!(plan, Strategy::Butterfly(*len));
+            let plan = planner.make_plan_for_len(*len);
+            assert_eq!(plan, Plan::Butterfly(*len));
         }
     }
 
@@ -351,7 +397,7 @@ mod unit_tests {
                 for pow5 in 1..3 {
                     for pow7 in 1..3 {
                         let len = 2usize.pow(pow2) * 3usize.pow(pow3) * 5usize.pow(pow5) * 7usize.pow(pow7);
-                        let plan = planner.make_strategy_for_len(len);
+                        let plan = planner.make_plan_for_len(len);
                         assert!(is_mixedradix(&plan), "Expected MixedRadix, got {:?}", plan);
                     }
                 }
@@ -359,9 +405,9 @@ mod unit_tests {
         }
     }
 
-    fn is_mixedradix(plan: &Strategy) -> bool {
+    fn is_mixedradix(plan: &Plan) -> bool {
         match plan {
-            &Strategy::MixedRadix{..} => true,
+            &Plan::MixedRadix{..} => true,
             _ => false,
         }
     }
@@ -371,14 +417,14 @@ mod unit_tests {
         // Products of two existing butterfly lengths that have a common divisor >1, and isn't a power of 2 should be MixedRadixDoubleButterfly
         let mut planner = FFTplanner::<f64>::new(false);
         for len in [4*6, 3*6, 3*3].iter() {
-            let plan = planner.make_strategy_for_len(*len);
+            let plan = planner.make_plan_for_len(*len);
             assert!(is_mixedradixbutterfly(&plan), "Expected MixedRadixDoubleButterfly, got {:?}", plan);
         }
     }
 
-    fn is_mixedradixbutterfly(plan: &Strategy) -> bool {
+    fn is_mixedradixbutterfly(plan: &Plan) -> bool {
         match plan {
-            &Strategy::MixedRadixDoubleButterfly{..} => true,
+            &Plan::MixedRadixDoubleButterfly{..} => true,
             _ => false,
         }
     }
@@ -387,34 +433,43 @@ mod unit_tests {
     fn test_plan_goodthomasbutterfly() {
         let mut planner = FFTplanner::<f64>::new(false);
         for len in [3*4, 3*5, 3*7, 5*7].iter() {
-            let plan = planner.make_strategy_for_len(*len);
+            let plan = planner.make_plan_for_len(*len);
             assert!(is_goodthomasbutterfly(&plan), "Expected GoodThomasDoubleButterfly, got {:?}", plan);
         }
     }
 
-    fn is_goodthomasbutterfly(plan: &Strategy) -> bool {
+    fn is_goodthomasbutterfly(plan: &Plan) -> bool {
         match plan {
-            &Strategy::GoodThomasDoubleButterfly{..} => true,
+            &Plan::GoodThomasDoubleButterfly{..} => true,
             _ => false,
         }
     }
 
     #[test]
     fn test_plan_bluestein() {
-        //let primes: [usize; 41] = [13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199];
         let primes: [usize; 6] = [89, 179, 359, 719, 1439, 2879];
 
         let mut planner = FFTplanner::<f64>::new(false);
         for len in primes.iter() {
-            let plan = planner.make_strategy_for_len(*len);
+            let plan = planner.make_plan_for_len(*len);
             assert!(is_bluesteins(&plan), "Expected Bluesteins, got {:?}", plan);
         }
     }
 
-    fn is_bluesteins(plan: &Strategy) -> bool {
+    fn is_bluesteins(plan: &Plan) -> bool {
         match plan {
-            &Strategy::Bluestein{..} => true,
+            &Plan::Bluestein{..} => true,
             _ => false,
+        }
+    }
+
+    #[test]
+    fn test_dft_cost() {
+        let lengths: [usize; 3] = [2, 4, 6];
+        for len in lengths.iter() {
+            let cost = 4*len.pow(2);
+            let plan = Plan::DFT(*len);
+            assert_eq!(plan.cost(), cost);
         }
     }
 }
