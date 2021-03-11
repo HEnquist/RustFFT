@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use num_complex::Complex;
 use num_traits::Zero;
-use transpose;
 
 use crate::array_utils;
 use crate::common::{fft_error_inplace, fft_error_outofplace};
@@ -124,7 +123,7 @@ impl<T: FftNum> MixedRadix<T> {
         let (scratch, inner_scratch) = scratch.split_at_mut(self.len());
 
         // STEP 1: transpose
-        transpose::transpose(buffer, scratch, self.width, self.height);
+        array_utils::transpose(buffer, scratch, self.width, self.height);
 
         // STEP 2: perform FFTs of size `height`
         let height_scratch = if inner_scratch.len() > buffer.len() {
@@ -141,14 +140,14 @@ impl<T: FftNum> MixedRadix<T> {
         }
 
         // STEP 4: transpose again
-        transpose::transpose(scratch, buffer, self.height, self.width);
+        array_utils::transpose(scratch, buffer, self.height, self.width);
 
         // STEP 5: perform FFTs of size `width`
         self.width_size_fft
             .process_outofplace_with_scratch(buffer, scratch, inner_scratch);
 
         // STEP 6: transpose again
-        transpose::transpose(scratch, buffer, self.width, self.height);
+        array_utils::transpose(scratch, buffer, self.width, self.height);
     }
 
     fn perform_fft_out_of_place(
@@ -160,7 +159,7 @@ impl<T: FftNum> MixedRadix<T> {
         // SIX STEP FFT:
 
         // STEP 1: transpose
-        transpose::transpose(input, output, self.width, self.height);
+        array_utils::transpose(input, output, self.width, self.height);
 
         // STEP 2: perform FFTs of size `height`
         let height_scratch = if scratch.len() > input.len() {
@@ -177,7 +176,7 @@ impl<T: FftNum> MixedRadix<T> {
         }
 
         // STEP 4: transpose again
-        transpose::transpose(output, input, self.height, self.width);
+        array_utils::transpose(output, input, self.height, self.width);
 
         // STEP 5: perform FFTs of size `width`
         let width_scratch = if scratch.len() > output.len() {
@@ -189,7 +188,7 @@ impl<T: FftNum> MixedRadix<T> {
             .process_with_scratch(input, width_scratch);
 
         // STEP 6: transpose again
-        transpose::transpose(input, output, self.width, self.height);
+        array_utils::transpose(input, output, self.width, self.height);
     }
 }
 boilerplate_fft!(

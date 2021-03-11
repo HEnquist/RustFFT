@@ -4,7 +4,6 @@ use std::sync::Arc;
 use num_complex::Complex;
 use num_integer::Integer;
 use strength_reduce::StrengthReducedUsize;
-use transpose;
 
 use crate::array_utils;
 use crate::common::{fft_error_inplace, fft_error_outofplace};
@@ -231,7 +230,7 @@ impl<T: FftNum> GoodThomasAlgorithm<T> {
             .process_with_scratch(scratch, width_scratch);
 
         // transpose
-        transpose::transpose(scratch, buffer, self.width, self.height);
+        array_utils::transpose(scratch, buffer, self.width, self.height);
 
         // run FFTs of size 'height'
         self.height_size_fft
@@ -260,7 +259,7 @@ impl<T: FftNum> GoodThomasAlgorithm<T> {
             .process_with_scratch(output, width_scratch);
 
         // transpose
-        transpose::transpose(output, input, self.width, self.height);
+        array_utils::transpose(output, input, self.width, self.height);
 
         // run FFTs of size 'height'
         let height_scratch = if scratch.len() > output.len() {
