@@ -12,8 +12,6 @@ pub unsafe fn transpose_small<T: Copy>(width: usize, height: usize, input: &[T],
     }
 }
 
-const BLOCK_SIZE: usize = 64;
-
 /// Transpose a subset of the array, from the input into the output. The idea is that by transposing one block at a time, we can be more cache-friendly
 /// SAFETY: Width * height must equal input.len() and output.len(), start_x + block_width must be <= width, start_y + block height must be <= height
 /// This function is taken directly from the "transpose" library.
@@ -31,13 +29,14 @@ unsafe fn transpose_block<T: Copy>(input: &[T], output: &mut [T], width: usize, 
     }
 }
 
+const NBR_SEGMENTS: usize = 4;
+
 /// Transpose a subset of the array, from the input into the output. The idea is that by transposing one block at a time, we can be more cache-friendly
 /// SAFETY: Width * height must equal input.len() and output.len(), start_x + block_width must be <= width, start_y + block height must be <= height
-/// Also divide the loop into 8 segments, to avoid repeatedly reading from start to end of the whole array. This makes it more cache friendly, 
-/// and for long lengths it's over 2x faster. 
-unsafe fn transpose_block_segmented8<T: Copy>(input: &[T], output: &mut [T], width: usize, height: usize, start_x: usize, start_y: usize, block_width: usize, block_height: usize) {
-    let height_per_div = block_height/8;
-    for subblock in 0..8 {
+/// Also divides the loop into smaller segments, to avoid long jumps back and forth in the data. This makes it more cache friendly. 
+unsafe fn transpose_block_segmented<T: Copy>(input: &[T], output: &mut [T], width: usize, height: usize, start_x: usize, start_y: usize, block_width: usize, block_height: usize) {
+    let height_per_div = block_height/NBR_SEGMENTS;
+    for subblock in 0..NBR_SEGMENTS {
         for inner_x in 0..block_width {
             for inner_y in 0..height_per_div {
                 let x = start_x + inner_x;
@@ -52,69 +51,87 @@ unsafe fn transpose_block_segmented8<T: Copy>(input: &[T], output: &mut [T], wid
     }
 }
 
+
+const BLOCK_SIZE: usize = 16;
+
 /// Given an array of size width * height, representing a flattened 2D array,
 /// transpose the rows and columns of that 2D array into the output.
-/// This is a customized version of the out-of-place transpose function from the "transpose" library.
-/// For the bulk of the work, it uses a modified function that tries to limit cache misses.
+/// This function is just a wrapper around the `recursive_transpose` function.
 pub fn transpose<T: Copy>(input: &[T], output: &mut [T], input_width: usize, input_height: usize) {
-    assert_eq!(input_width*input_height, input.len());
-    assert_eq!(input_width*input_height, output.len());
+    recursive_transpose(input, output, 0, input_height, 0, input_width, input_width, input_height);
+}
 
-    let x_block_count = input_width / BLOCK_SIZE;
-    let y_block_count = input_height / BLOCK_SIZE;
+/// Given an array of size width * height, representing a flattened 2D array,
+/// transpose the rows and columns of that 2D array into the output.
+/// This is a recursive algorithm that divides the array into smaller pieces, until they are small enough to
+/// transpose directly without worrying about cache misses.
+/// Once they are small enough, they are transposed using a tiling algorithm. 
+fn recursive_transpose<T: Copy>(input: &[T], output: &mut [T], row_start: usize, row_end: usize, col_start: usize, col_end:  usize, total_columns: usize, total_rows: usize) {
+    let nbr_rows = row_end - row_start; 
+    let nbr_cols = col_end - col_start;
+    if (nbr_rows <= 128 && nbr_cols <= 128) || nbr_rows<=2 || nbr_cols<=2 {
+        let x_block_count = nbr_cols / BLOCK_SIZE;
+        let y_block_count = nbr_rows / BLOCK_SIZE;
 
-    let remainder_x = input_width - x_block_count * BLOCK_SIZE;
-    let remainder_y = input_height - y_block_count * BLOCK_SIZE;
+        let remainder_x = nbr_cols - x_block_count * BLOCK_SIZE;
+        let remainder_y = nbr_rows - y_block_count * BLOCK_SIZE;
 
 
-    for y_block in 0..y_block_count {
-        for x_block in 0..x_block_count {
-            unsafe {
-                transpose_block_segmented8(
-                    input, output,
-                    input_width, input_height,
-                    x_block * BLOCK_SIZE, y_block * BLOCK_SIZE,
-                    BLOCK_SIZE, BLOCK_SIZE,
-                    );
+        for y_block in 0..y_block_count {
+            for x_block in 0..x_block_count {
+                unsafe {
+                    transpose_block_segmented(
+                        input, output,
+                        total_columns, total_rows,
+                        col_start + x_block * BLOCK_SIZE, row_start + y_block * BLOCK_SIZE,
+                        BLOCK_SIZE, BLOCK_SIZE,
+                        );
+                }
+            }
+
+            //if the input_width is not cleanly divisible by block_size, there are still a few columns that haven't been transposed
+            if remainder_x > 0 {
+                unsafe {
+                    transpose_block(
+                        input, output,
+                        total_columns, total_rows,
+                        col_start + x_block_count * BLOCK_SIZE, row_start + y_block * BLOCK_SIZE, 
+                        remainder_x, BLOCK_SIZE);
+                }
             }
         }
 
-        //if the input_width is not cleanly divisible by block_size, there are still a few columns that haven't been transposed
-        if remainder_x > 0 {
-            unsafe {
-                transpose_block(
-                    input, output, 
-                    input_width, input_height, 
-                    input_width - remainder_x, y_block * BLOCK_SIZE, 
-                    remainder_x, BLOCK_SIZE);
+        //if the input_height is not cleanly divisible by BLOCK_SIZE, there are still a few rows that haven't been transposed
+        if remainder_y > 0 {
+            for x_block in 0..x_block_count {
+                unsafe {
+                    transpose_block(
+                        input, output,
+                        total_columns, total_rows,
+                        col_start + x_block * BLOCK_SIZE, row_start + y_block_count * BLOCK_SIZE,
+                        BLOCK_SIZE, remainder_y,
+                        );
+                }
             }
-        }
+        
+            //if the input_width is not cleanly divisible by block_size, there are still a few rows+columns that haven't been transposed
+            if remainder_x > 0 {
+                unsafe {
+                    transpose_block(
+                        input, output,
+                        total_columns, total_rows,
+                        col_start + x_block_count * BLOCK_SIZE,  row_start + y_block_count * BLOCK_SIZE, 
+                        remainder_x, remainder_y);
+                }
+            }
+        } 
+    } else if nbr_rows >= nbr_cols {
+        recursive_transpose(input, output, row_start, row_start + (nbr_rows / 2), col_start, col_end, total_columns, total_rows);
+        recursive_transpose(input, output, row_start + (nbr_rows / 2), row_end, col_start, col_end, total_columns, total_rows);
+    } else {
+        recursive_transpose(input, output, row_start, row_end, col_start, col_start + (nbr_cols / 2), total_columns, total_rows);
+        recursive_transpose(input, output, row_start, row_end, col_start + (nbr_cols / 2), col_end, total_columns, total_rows);
     }
-
-    //if the input_height is not cleanly divisible by BLOCK_SIZE, there are still a few rows that haven't been transposed
-    if remainder_y > 0 {
-        for x_block in 0..x_block_count {
-            unsafe {
-                transpose_block(
-                    input, output,
-                    input_width, input_height,
-                    x_block * BLOCK_SIZE, input_height - remainder_y,
-                    BLOCK_SIZE, remainder_y,
-                    );
-            }
-        }
-
-        //if the input_width is not cleanly divisible by block_size, there are still a few rows+columns that haven't been transposed
-        if remainder_x > 0 {
-            unsafe {
-                transpose_block(
-                    input, output,
-                    input_width, input_height, 
-                    input_width - remainder_x, input_height - remainder_y, 
-                    remainder_x, remainder_y);
-            }
-        }
-    } 
 }
 
 #[allow(unused)]
@@ -208,13 +225,6 @@ impl<T> RawSliceMut<T> {
         *self.ptr.add(index) = value;
     }
 }
-//impl<T: Copy> RawSliceMut<T> {
-//    #[inline(always)]
-//    pub unsafe fn load(&self, index: usize) -> T {
-//        debug_assert!(index < self.slice_len);
-//        *self.ptr.add(index)
-//    }
-//}
 
 #[cfg(test)]
 mod unit_tests {
@@ -257,6 +267,8 @@ mod unit_tests {
 
         for &width in &sizes {
             for &height in &sizes {
+                let width = 10*width;
+                let height = 10*height;
                 let len = width * height;
 
                 let input: Vec<Complex<f32>> = random_signal(len);

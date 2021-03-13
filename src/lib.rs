@@ -100,7 +100,7 @@ mod common;
 
 /// Individual FFT algorithms
 pub mod algorithm;
-mod array_utils;
+pub mod array_utils;
 mod fft_cache;
 mod math_utils;
 mod plan;
