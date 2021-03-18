@@ -19,8 +19,8 @@ macro_rules! interleave_complex_f32 {
     ($input:ident, $offset:literal, { $($idx:literal),* }) => {
         [
         $(
-            pack_1st_f32($input[$idx], $input[$idx+$offset]),
-            pack_2nd_f32($input[$idx], $input[$idx+$offset]),
+            pack_1st_f32(&$input[$idx], &$input[$idx+$offset]),
+            pack_2nd_f32(&$input[$idx], &$input[$idx+$offset]),
         )*
         ]
     }
@@ -45,10 +45,10 @@ macro_rules! separate_interleaved_complex_f32 {
     ($input:ident, { $($idx:literal),* }) => {
         [
         $(
-            pack_1st_f32($input[$idx], $input[$idx+1]),
+            pack_1st_f32(&$input[$idx], &$input[$idx+1]),
         )*
         $(
-            pack_2nd_f32($input[$idx], $input[$idx+1]),
+            pack_2nd_f32(&$input[$idx], &$input[$idx+1]),
         )*
         ]
     }

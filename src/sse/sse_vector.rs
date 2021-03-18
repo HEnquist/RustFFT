@@ -3,6 +3,8 @@ use num_complex::Complex;
 
 use crate::array_utils::{RawSlice, RawSliceMut};
 
+use super::sse_utils::SseF32x4;
+
 
 // Read these indexes from an SseArray and build an array of simd vectors.
 // Takes a name of a vector to read from, and a list of indexes to read.
@@ -115,13 +117,13 @@ pub trait SseArray {
 }
 
 impl SseArray for RawSlice<Complex<f32>> {
-    type VectorType = __m128;
+    type VectorType = SseF32x4;
     const COMPLEX_PER_VECTOR: usize = 2;
     
     #[inline(always)]
     unsafe fn load_complex(&self, index: usize) -> Self::VectorType {
         debug_assert!(self.len() >= index + Self::COMPLEX_PER_VECTOR);
-        _mm_loadu_ps(self.as_ptr().add(index) as *const f32)
+        Self::VectorType::new(_mm_loadu_ps(self.as_ptr().add(index) as *const f32))
     }
 
     #[inline(always)]
@@ -130,7 +132,7 @@ impl SseArray for RawSlice<Complex<f32>> {
         index: usize,
     ) -> Self::VectorType {
         debug_assert!(self.len() >= index + 1);
-        _mm_castpd_ps(_mm_load_sd(self.as_ptr().add(index) as *const f64))
+        Self::VectorType::new(_mm_castpd_ps(_mm_load_sd(self.as_ptr().add(index) as *const f64)))
     }
 
     #[inline(always)]
@@ -139,7 +141,7 @@ impl SseArray for RawSlice<Complex<f32>> {
         index: usize,
     ) -> Self::VectorType {
         debug_assert!(self.len() >= index + 1);
-        _mm_castpd_ps(_mm_load1_pd(self.as_ptr().add(index) as *const f64))
+        Self::VectorType::new( _mm_castpd_ps(_mm_load1_pd(self.as_ptr().add(index) as *const f64)))
     }
 }
 
@@ -188,13 +190,13 @@ pub trait SseArrayMut {
 }
 
 impl SseArrayMut for RawSliceMut<Complex<f32>> {
-    type VectorType = __m128;
+    type VectorType = SseF32x4;
     const COMPLEX_PER_VECTOR: usize = 2;
     
     #[inline(always)]
     unsafe fn store_complex(&self, vector: Self::VectorType, index: usize) {
         debug_assert!(self.len() >= index + Self::COMPLEX_PER_VECTOR);
-        _mm_storeu_ps(self.as_mut_ptr().add(index) as *mut f32, vector);
+        _mm_storeu_ps(self.as_mut_ptr().add(index) as *mut f32, vector.get());
     }
 
     #[inline(always)]
@@ -204,7 +206,7 @@ impl SseArrayMut for RawSliceMut<Complex<f32>> {
         index: usize,
     ) {
         debug_assert!(self.len() >= index + 1);
-        _mm_storeh_pd(self.as_mut_ptr().add(index) as *mut f64, _mm_castps_pd(vector));
+        _mm_storeh_pd(self.as_mut_ptr().add(index) as *mut f64, _mm_castps_pd(vector.get()));
     }
     #[inline(always)]
     unsafe fn store_partial_lo_complex(
@@ -213,7 +215,7 @@ impl SseArrayMut for RawSliceMut<Complex<f32>> {
         index: usize,
     ) {
         debug_assert!(self.len() >= index + 1);
-        _mm_storel_pd(self.as_mut_ptr().add(index) as *mut f64, _mm_castps_pd(vector));
+        _mm_storel_pd(self.as_mut_ptr().add(index) as *mut f64, _mm_castps_pd(vector.get()));
     }
 }
 

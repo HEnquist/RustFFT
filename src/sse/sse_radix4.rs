@@ -44,7 +44,7 @@ enum Sse64Butterfly<T> {
 
 pub struct Sse32Radix4<T> {
     _phantom: std::marker::PhantomData<T>,
-    twiddles: Box<[__m128]>,
+    twiddles: Box<[SseF32x4]>,
 
     base_fft: Sse32Butterfly<T>,
     base_len: usize,
@@ -99,7 +99,7 @@ impl<T: FftNum> Sse32Radix4<T> {
                             direction,
                         );
                         let twiddles_packed =
-                            _mm_set_ps(twiddle_b.im, twiddle_b.re, twiddle_a.im, twiddle_a.re);
+                            SseF32x4::new(_mm_set_ps(twiddle_b.im, twiddle_b.re, twiddle_a.im, twiddle_a.re));
                         twiddle_factors.push(twiddles_packed);
                     }
                 }
@@ -158,7 +158,7 @@ impl<T: FftNum> Sse32Radix4<T> {
 
         // cross-FFTs
         let mut current_size = self.base_len * 4;
-        let mut layer_twiddles: &[__m128] = &self.twiddles;
+        let mut layer_twiddles: &[SseF32x4] = &self.twiddles;
 
         while current_size <= signal.len() {
             let num_rows = signal.len() / current_size;
@@ -185,7 +185,7 @@ boilerplate_fft_sse_oop!(Sse32Radix4, |this: &Sse32Radix4<_>| this.len);
 #[target_feature(enable = "sse4.1")]
 unsafe fn butterfly_4_32<T: FftNum>(
     data: &mut [Complex<T>],
-    twiddles: &[__m128],
+    twiddles: &[SseF32x4],
     num_ffts: usize,
     bf4: &SseF32Butterfly4<T>,
 ) {
@@ -202,12 +202,12 @@ unsafe fn butterfly_4_32<T: FftNum>(
         let mut scratch3 = input.load_complex(idx + 3 * num_ffts);
         let mut scratch3b = input.load_complex(idx + 2 + 3 * num_ffts);
 
-        scratch1 = mul_complex_f32(scratch1, tw[0]);
-        scratch2 = mul_complex_f32(scratch2, tw[1]);
-        scratch3 = mul_complex_f32(scratch3, tw[2]);
-        scratch1b = mul_complex_f32(scratch1b, tw[3]);
-        scratch2b = mul_complex_f32(scratch2b, tw[4]);
-        scratch3b = mul_complex_f32(scratch3b, tw[5]);
+        scratch1 = mul_complex_f32(&scratch1, &tw[0]);
+        scratch2 = mul_complex_f32(&scratch2, &tw[1]);
+        scratch3 = mul_complex_f32(&scratch3, &tw[2]);
+        scratch1b = mul_complex_f32(&scratch1b, &tw[3]);
+        scratch2b = mul_complex_f32(&scratch2b, &tw[4]);
+        scratch3b = mul_complex_f32(&scratch3b, &tw[5]);
 
         let scratch = bf4.perform_dual_fft_direct(scratch0, scratch1, scratch2, scratch3);
         let scratchb = bf4.perform_dual_fft_direct(scratch0b, scratch1b, scratch2b, scratch3b);
