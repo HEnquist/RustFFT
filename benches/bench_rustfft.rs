@@ -426,9 +426,21 @@ fn bench_radix4(b: &mut Bencher, len: usize) {
 
 #[bench] fn radix4_______64(b: &mut Bencher) { bench_radix4(b, 64); }
 #[bench] fn radix4______256(b: &mut Bencher) { bench_radix4(b, 256); }
+#[bench] fn radix4______512(b: &mut Bencher) { bench_radix4(b, 512); }
 #[bench] fn radix4_____1024(b: &mut Bencher) { bench_radix4(b, 1024); }
+#[bench] fn radix4_____2048(b: &mut Bencher) { bench_radix4(b, 2048); }
+#[bench] fn radix4_____4096(b: &mut Bencher) { bench_radix4(b, 4096); }
+#[bench] fn radix4_____8192(b: &mut Bencher) { bench_radix4(b, 8192); }
+#[bench] fn radix4____16384(b: &mut Bencher) { bench_radix4(b, 16384); }
+#[bench] fn radix4____32768(b: &mut Bencher) { bench_radix4(b, 32768); }
 #[bench] fn radix4____65536(b: &mut Bencher) { bench_radix4(b, 65536); }
+#[bench] fn radix4___131072(b: &mut Bencher) { bench_radix4(b, 131072); }
+#[bench] fn radix4___262144(b: &mut Bencher) { bench_radix4(b, 262144); }
+#[bench] fn radix4___524288(b: &mut Bencher) { bench_radix4(b, 524288); }
 #[bench] fn radix4__1048576(b: &mut Bencher) { bench_radix4(b, 1048576); }
+#[bench] fn radix4__2097152(b: &mut Bencher) { bench_radix4(b, 2097152); }
+#[bench] fn radix4__4194304(b: &mut Bencher) { bench_radix4(b, 4194304); }
+//#[bench] fn radix4__8388608(b: &mut Bencher) { bench_radix4(b, 8388608); }
 //#[bench] fn radix4_16777216(b: &mut Bencher) { bench_radix4(b, 16777216); }
 
 fn get_mixed_radix_power2(len: usize) -> Arc<dyn Fft<f32>> {
