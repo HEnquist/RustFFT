@@ -95,8 +95,24 @@ impl<T: FftNum> Radix4<T> {
         spectrum: &mut [Complex<T>],
         _scratch: &mut [Complex<T>],
     ) {
-        // copy the data into the spectrum vector
-        prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
+        // copy the data into the spectrum vector, split the copying up into chunks to make it more cache friendly
+        let mut num_chunks = signal.len() / 8192;
+        if num_chunks == 0 {
+            num_chunks = 1;
+        } else if num_chunks > self.base_len {
+            num_chunks = self.base_len;
+        }
+        for n in 0..num_chunks {
+            prepare_radix4(
+                signal.len(),
+                self.base_len,
+                signal,
+                spectrum,
+                1,
+                n,
+                num_chunks,
+            );
+        }
 
         // Base-level FFTs
         self.base_fft.process_with_scratch(spectrum, &mut []);
@@ -129,18 +145,20 @@ impl<T: FftNum> Radix4<T> {
 }
 boilerplate_fft_oop!(Radix4, |this: &Radix4<_>| this.len);
 
-// after testing an iterative bit reversal algorithm, this recursive algorithm
-// was almost an order of magnitude faster at setting up
 fn prepare_radix4<T: FftNum>(
     size: usize,
     base_len: usize,
     signal: &[Complex<T>],
     spectrum: &mut [Complex<T>],
     stride: usize,
+    chunk: usize,
+    nbr_chunks: usize,
 ) {
-    if size == base_len {
+    if size == (4 * base_len) {
+        do_radix4_shuffle(size, signal, spectrum, stride, chunk, nbr_chunks);
+    } else if size == base_len {
         unsafe {
-            for i in 0..size {
+            for i in (chunk * base_len / nbr_chunks)..((chunk + 1) * base_len / nbr_chunks) {
                 *spectrum.get_unchecked_mut(i) = *signal.get_unchecked(i * stride);
             }
         }
@@ -152,7 +170,35 @@ fn prepare_radix4<T: FftNum>(
                 &signal[i * stride..],
                 &mut spectrum[i * (size / 4)..],
                 stride * 4,
+                chunk,
+                nbr_chunks,
             );
+        }
+    }
+}
+
+fn do_radix4_shuffle<T: FftNum>(
+    size: usize,
+    signal: &[Complex<T>],
+    spectrum: &mut [Complex<T>],
+    stride: usize,
+    chunk: usize,
+    nbr_chunks: usize,
+) {
+    let stepsize = size / 4;
+    let stepstride = stride * 4;
+    let signal_offset = stride;
+    let spectrum_offset = size / 4;
+    unsafe {
+        for i in (chunk * stepsize / nbr_chunks)..((chunk + 1) * stepsize / nbr_chunks) {
+            let val0 = *signal.get_unchecked(i * stepstride);
+            let val1 = *signal.get_unchecked(i * stepstride + signal_offset);
+            let val2 = *signal.get_unchecked(i * stepstride + 2 * signal_offset);
+            let val3 = *signal.get_unchecked(i * stepstride + 3 * signal_offset);
+            *spectrum.get_unchecked_mut(i) = val0;
+            *spectrum.get_unchecked_mut(i + spectrum_offset) = val1;
+            *spectrum.get_unchecked_mut(i + 2 * spectrum_offset) = val2;
+            *spectrum.get_unchecked_mut(i + 3 * spectrum_offset) = val3;
         }
     }
 }
@@ -166,13 +212,12 @@ unsafe fn butterfly_4<T: FftNum>(
     let butterfly4 = Butterfly4::new(direction);
 
     let mut idx = 0usize;
-    let mut tw_idx = 0usize;
     let mut scratch = [Zero::zero(); 4];
-    for _ in 0..num_ffts {
+    for tw in twiddles.chunks_exact(3).take(num_ffts) {
         scratch[0] = *data.get_unchecked(idx);
-        scratch[1] = *data.get_unchecked(idx + 1 * num_ffts) * twiddles[tw_idx];
-        scratch[2] = *data.get_unchecked(idx + 2 * num_ffts) * twiddles[tw_idx + 1];
-        scratch[3] = *data.get_unchecked(idx + 3 * num_ffts) * twiddles[tw_idx + 2];
+        scratch[1] = *data.get_unchecked(idx + 1 * num_ffts) * tw[0];
+        scratch[2] = *data.get_unchecked(idx + 2 * num_ffts) * tw[1];
+        scratch[3] = *data.get_unchecked(idx + 3 * num_ffts) * tw[2];
 
         butterfly4.perform_fft_contiguous(RawSlice::new(&scratch), RawSliceMut::new(&mut scratch));
 
@@ -181,7 +226,6 @@ unsafe fn butterfly_4<T: FftNum>(
         *data.get_unchecked_mut(idx + 2 * num_ffts) = scratch[2];
         *data.get_unchecked_mut(idx + 3 * num_ffts) = scratch[3];
 
-        tw_idx += 3;
         idx += 1;
     }
 }
