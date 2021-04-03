@@ -98,7 +98,7 @@ impl<T: FftNum> FftPlanner<T> {
 }
 
 const MIN_RADIX4_BITS: u32 = 5; // smallest size to consider radix 4 an option is 2^5 = 32
-const MAX_RADIX4_BITS: u32 = 18; // largest size to consider radix 4 an option is 2^18
+const MAX_RADIX4_BITS: u32 = 180; // largest size to consider radix 4 an option is 2^18
 const MAX_RADER_PRIME_FACTOR: usize = 23; // don't use Raders if the inner fft length has prime factor larger than this
 const MIN_BLUESTEIN_MIXED_RADIX_LEN: usize = 90; // only use mixed radix for the inner fft of Bluestein if length is larger than this
 

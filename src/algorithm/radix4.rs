@@ -96,11 +96,11 @@ impl<T: FftNum> Radix4<T> {
         _scratch: &mut [Complex<T>],
     ) {
         // copy the data into the spectrum vector, split the copying up into chunks to make it more cache friendly
-        let mut num_chunks = signal.len() / 8192;
+        let mut num_chunks = signal.len() / (2*8192);
         if num_chunks == 0 {
             num_chunks = 1;
-        } else if num_chunks > self.base_len {
-            num_chunks = self.base_len;
+        } else if num_chunks > self.base_len/4 {
+            num_chunks = self.base_len/4;
         }
         for n in 0..num_chunks {
             prepare_radix4(
@@ -199,6 +199,28 @@ fn do_radix4_shuffle<T: FftNum>(
             *spectrum.get_unchecked_mut(i + spectrum_offset) = val1;
             *spectrum.get_unchecked_mut(i + 2 * spectrum_offset) = val2;
             *spectrum.get_unchecked_mut(i + 3 * spectrum_offset) = val3;
+        }
+    }
+}
+
+pub fn reverse_bits(value: usize, bits: usize) -> usize {
+    let mut result: usize = 0; 
+    let mut value = value;
+    for _ in 0..bits/2 {
+        result = (result<<2) + (value & 0x03);
+        value = value>>2;
+    }
+    result
+}
+
+pub unsafe fn bitrev_transpose<T: Copy>(width: usize, height: usize, input: &[T], output: &mut [T], bits: usize) {
+    for x in 0..width {
+        let x_rev = reverse_bits(x, bits);
+        for y in 0..height {
+            let input_index = x_rev + y * width;
+            let output_index = y + x * height;
+
+            *output.get_unchecked_mut(output_index) = *input.get_unchecked(input_index);
         }
     }
 }
