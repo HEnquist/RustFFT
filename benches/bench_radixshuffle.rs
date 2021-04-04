@@ -212,7 +212,7 @@ fn bench_current(b: &mut Bencher, len: usize) {
 //#[bench] fn radix4__8388608(b: &mut Bencher) { bench_radix4(b, 8388608); }
 //#[bench] fn radix4_16777216(b: &mut Bencher) { bench_radix4(b, 16777216); }'
 
-
+/*
 fn run_prepare_tweaked<T: FftNum>(
     signal: &[Complex<T>],
     spectrum: &mut [Complex<T>],
@@ -317,6 +317,7 @@ fn bench_tweaked(b: &mut Bencher, len: usize) {
 #[bench] fn prep__4194304_tweaked(b: &mut Bencher) { bench_tweaked(b, 4194304); }
 //#[bench] fn radix4__8388608(b: &mut Bencher) { bench_radix4(b, 8388608); }
 //#[bench] fn radix4_16777216(b: &mut Bencher) { bench_radix4(b, 16777216); }
+*/
 
 pub fn reverse_bits(value: usize, bits: usize) -> usize {
     let mut result: usize = 0; 
@@ -332,6 +333,21 @@ pub unsafe fn bitrev_transpose<T: Copy>(width: usize, height: usize, input: &[T]
     for x in 0..width {
         let x_rev = reverse_bits(x, bits);
         for y in 0..height {
+            let input_index = x_rev + y * width;
+            let output_index = y + x * height;
+
+            *output.get_unchecked_mut(output_index) = *input.get_unchecked(input_index);
+        }
+    }
+}
+
+pub unsafe fn bitrev_transpose_2<T: Copy>(width: usize, height: usize, input: &[T], output: &mut [T], shuffled: &[(usize, usize)]) {
+    for y in 0..height {
+        //for x in 0..width {
+        for (x, x_rev) in shuffled.iter() {
+            //let x_rev = reverse_bits(x, bits);
+            //let x_rev = shuffled.get_unchecked(x); 
+        
             let input_index = x_rev + y * width;
             let output_index = y + x * height;
 
@@ -359,7 +375,15 @@ fn bench_reverse(b: &mut Bencher, len: usize) {
     };
     let width = len/base_len;
     let rev_bits = (width.trailing_zeros()/2) as usize;
-    b.iter(|| unsafe {bitrev_transpose(width, base_len, &signal, &mut spectrum, rev_bits);} );
+    let mut shuffled = (0..width).map(|val| (val, reverse_bits(val, rev_bits))).collect::<Vec<(usize, usize)>>();
+    if width > (4*8192) {
+        let chunks = width/(4*8192);
+        let width_per_chunk = width / chunks;
+        shuffled.sort_by(|a, b| (a.1/width_per_chunk).partial_cmp(&(b.1/width_per_chunk)).unwrap());
+    }
+    
+    //b.iter(|| unsafe {bitrev_transpose(width, base_len, &signal, &mut spectrum, rev_bits);} );
+    b.iter(|| unsafe {bitrev_transpose_2(width, base_len, &signal, &mut spectrum, &shuffled);} );
 }
 
 #[bench] fn prep_______64_reverse(b: &mut Bencher) { bench_reverse(b, 64); }
