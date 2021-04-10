@@ -15,7 +15,7 @@ use crate::Fft;
 use crate::math_utils::{PrimeFactor, PrimeFactors};
 
 const MIN_RADIX4_BITS: u32 = 6; // smallest size to consider radix 4 an option is 2^6 = 64
-const MAX_RADIX4_BITS: u32 = 16; // largest size to consider radix 4 an option is 2^16
+const MAX_RADIX4_BITS: u32 = 20; // largest size to consider radix 4 an option is 2^20 = 1 048 576
 const MAX_RADER_PRIME_FACTOR: usize = 23; // don't use Raders if the inner fft length has prime factor larger than this
 const MIN_BLUESTEIN_MIXED_RADIX_LEN: usize = 90; // only use mixed radix for the inner fft of Bluestein if length is larger than this
 

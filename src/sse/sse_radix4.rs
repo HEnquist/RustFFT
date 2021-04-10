@@ -45,6 +45,7 @@ enum Sse64Butterfly<T> {
 pub struct Sse32Radix4<T> {
     _phantom: std::marker::PhantomData<T>,
     twiddles: Box<[__m128]>,
+    shuffle_map: Box<[usize]>,
 
     base_fft: Sse32Butterfly<T>,
     base_len: usize,
@@ -107,9 +108,14 @@ impl<T: FftNum> Sse32Radix4<T> {
             twiddle_stride >>= 2;
         }
 
+        // make a lookup table for the bit reverse shuffling 
+        let rest_len = len/base_len;
+        let bitpairs = (rest_len.trailing_zeros()/2) as usize;
+        let mut shuffle_map = (0..rest_len).map(|val| reverse_bits(val, bitpairs)).collect::<Vec<usize>>();
+
         Self {
             twiddles: twiddle_factors.into_boxed_slice(),
-
+            shuffle_map: shuffle_map.into_boxed_slice(),
             base_fft,
             base_len,
 
@@ -128,7 +134,14 @@ impl<T: FftNum> Sse32Radix4<T> {
         _scratch: &mut [Complex<T>],
     ) {
         // copy the data into the spectrum vector
-        prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
+        if self.shuffle_map.len() < 4 {
+            spectrum.copy_from_slice(signal);
+            //bitreversed_transpose_simple(self.base_len, signal, spectrum, &self.shuffle_map);
+        }
+        else {
+            bitreversed_transpose(self.base_len, signal, spectrum, &self.shuffle_map);
+        }
+        //prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
 
         // Base-level FFTs
         match &self.base_fft {
@@ -212,6 +225,7 @@ unsafe fn butterfly_4_32<T: FftNum>(
 pub struct Sse64Radix4<T> {
     _phantom: std::marker::PhantomData<T>,
     twiddles: Box<[__m128d]>,
+    shuffle_map: Box<[usize]>,
 
     base_fft: Sse64Butterfly<T>,
     base_len: usize,
@@ -269,9 +283,14 @@ impl<T: FftNum> Sse64Radix4<T> {
             twiddle_stride >>= 2;
         }
 
+        // make a lookup table for the bit reverse shuffling 
+        let rest_len = len/base_len;
+        let bitpairs = (rest_len.trailing_zeros()/2) as usize;
+        let mut shuffle_map = (0..rest_len).map(|val| reverse_bits(val, bitpairs)).collect::<Vec<usize>>();
+
         Self {
             twiddles: twiddle_factors.into_boxed_slice(),
-
+            shuffle_map: shuffle_map.into_boxed_slice(),
             base_fft,
             base_len,
 
@@ -290,7 +309,14 @@ impl<T: FftNum> Sse64Radix4<T> {
         _scratch: &mut [Complex<T>],
     ) {
         // copy the data into the spectrum vector
-        prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
+        if self.shuffle_map.len() < 4 {
+            spectrum.copy_from_slice(signal);
+            //bitreversed_transpose_simple(self.base_len, signal, spectrum, &self.shuffle_map);
+        }
+        else {
+            bitreversed_transpose(self.base_len, signal, spectrum, &self.shuffle_map);
+        }
+        //prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
 
         // Base-level FFTs
         match &self.base_fft {
@@ -352,6 +378,66 @@ fn prepare_radix4<T: FftNum>(
                 &mut spectrum[i * (size / 4)..],
                 stride * 4,
             );
+        }
+    }
+}
+
+// Reverse bits of value, in pairs.
+// For 8 bits: abcdefgh -> ghefcdab
+fn reverse_bits(value: usize, bitpairs: usize) -> usize {
+    let mut result: usize = 0; 
+    let mut value = value;
+    for _ in 0..bitpairs {
+        result = (result<<2) + (value & 0x03);
+        value = value>>2;
+    }
+    result
+}
+
+// Preparing for radix 4 is similar to a transpose, where the column index is bit reversed. 
+// Use a lookup table to avoid repeating the slow bit reverse operations.
+// This version unrolls both the inner and outer loop by a factor 2. This is faster, but 
+pub unsafe fn bitreversed_transpose<T: Copy>(base_len: usize, input: &[T], output: &mut [T], shuffle_map: &[usize]) {
+    let width = shuffle_map.len();
+    for y in 0..base_len/2 {
+        let y0 = 2*y;
+        let y1 = 2*y + 1;
+        for x in 0..width/2 {
+            let x0 = 2*x;
+            let x1 = 2*x + 1;
+            
+            let x_rev0 = shuffle_map.get_unchecked(x0);
+            let x_rev1 = shuffle_map.get_unchecked(x1);
+
+            let input_index0 = x_rev0 + y0 * width;
+            let input_index1 = x_rev0 + y1 * width;
+            let input_index2 = x_rev1 + y0 * width;
+            let input_index3 = x_rev1 + y1 * width;
+            let output_index0 = y0 + x0 * base_len;
+            let output_index1 = y1 + x0 * base_len;
+            let output_index2 = y0 + x1 * base_len;
+            let output_index3 = y1 + x1 * base_len;
+
+            *output.get_unchecked_mut(output_index0) = *input.get_unchecked(input_index0);
+            *output.get_unchecked_mut(output_index1) = *input.get_unchecked(input_index1);
+            *output.get_unchecked_mut(output_index2) = *input.get_unchecked(input_index2);
+            *output.get_unchecked_mut(output_index3) = *input.get_unchecked(input_index3);
+        }
+    }
+}
+
+// Preparing for radix 4 is similar to a transpose, where the column index is bit reversed. 
+// Use a lookup table to avoid repeating the slow bit reverse operations.
+pub unsafe fn bitreversed_transpose_simple<T: Copy>(base_len: usize, input: &[T], output: &mut [T], shuffled: &[usize]) {
+    let width = shuffled.len();
+    for y in 0..base_len {
+        for x in 0..width {
+            let x_rev = shuffled.get_unchecked(x); 
+        
+            let input_index = x_rev + y * width;
+            let output_index = y + x * base_len;
+
+            *output.get_unchecked_mut(output_index) = *input.get_unchecked(input_index);
         }
     }
 }
