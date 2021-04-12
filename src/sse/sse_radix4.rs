@@ -139,7 +139,7 @@ impl<T: FftNum> Sse32Radix4<T> {
             //bitreversed_transpose_simple(self.base_len, signal, spectrum, &self.shuffle_map);
         }
         else {
-            bitreversed_transpose(self.base_len, signal, spectrum, &self.shuffle_map);
+            bitreversed_transpose_inv(self.base_len, signal, spectrum, &self.shuffle_map);
         }
         //prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
 
@@ -314,7 +314,7 @@ impl<T: FftNum> Sse64Radix4<T> {
             //bitreversed_transpose_simple(self.base_len, signal, spectrum, &self.shuffle_map);
         }
         else {
-            bitreversed_transpose(self.base_len, signal, spectrum, &self.shuffle_map);
+            bitreversed_transpose_inv(self.base_len, signal, spectrum, &self.shuffle_map);
         }
         //prepare_radix4(signal.len(), self.base_len, signal, spectrum, 1);
 
@@ -436,6 +436,19 @@ pub unsafe fn bitreversed_transpose_simple<T: Copy>(base_len: usize, input: &[T]
         
             let input_index = x_rev + y * width;
             let output_index = y + x * base_len;
+
+            *output.get_unchecked_mut(output_index) = *input.get_unchecked(input_index);
+        }
+    }
+}
+
+pub unsafe fn bitreversed_transpose_inv<T: Copy>(height: usize, input: &[T], output: &mut [T], shuffled: &[usize]) {
+    let width = shuffled.len();
+    for x in 0..width {
+        let x_rev = shuffled.get_unchecked(x); 
+        for y in 0..height {
+            let input_index = x + y * width;
+            let output_index = y + x_rev * height;
 
             *output.get_unchecked_mut(output_index) = *input.get_unchecked(input_index);
         }
