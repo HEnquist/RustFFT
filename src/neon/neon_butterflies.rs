@@ -678,13 +678,15 @@ impl<T: FftNum> NeonF32Butterfly4<T> {
         input: RawSlice<Complex<f32>>,
         output: RawSliceMut<Complex<f32>>,
     ) {
-        let value01a = input.load_complex(0);
-        let value23a = input.load_complex(2);
-        let value01b = input.load_complex(4);
-        let value23b = input.load_complex(6);
+        // let value01a = input.load_complex(0);
+        // let value23a = input.load_complex(2);
+        // let value01b = input.load_complex(4);
+        // let value23b = input.load_complex(6);
 
-        let [value0ab, value1ab] = transpose_complex_2x2_f32(value01a, value01b);
-        let [value2ab, value3ab] = transpose_complex_2x2_f32(value23a, value23b);
+        // let [value0ab, value1ab] = transpose_complex_2x2_f32(value01a, value01b);
+        // let [value2ab, value3ab] = transpose_complex_2x2_f32(value23a, value23b);
+
+        let [value0ab, value1ab, value2ab, value3ab] = input.load_interleave4_complex(0);
 
         let out = self.perform_parallel_fft_direct(value0ab, value1ab, value2ab, value3ab);
 

@@ -130,6 +130,12 @@ pub trait NeonArray {
     const COMPLEX_PER_VECTOR: usize;
     // Load complex numbers from the array to fill a Neon vector.
     unsafe fn load_complex(&self, index: usize) -> Self::VectorType;
+    // Load complex numbers from the array to fill two Neon vectors, while interleaving the values.
+    unsafe fn load_interleave2_complex(&self, index: usize) -> [Self::VectorType; 2];
+    // Load complex numbers from the array to fill three Neon vectors, while interleaving the values.
+    unsafe fn load_interleave3_complex(&self, index: usize) -> [Self::VectorType; 3];
+    // Load complex numbers from the array to fill four Neon vectors, while interleaving the values.
+    unsafe fn load_interleave4_complex(&self, index: usize) -> [Self::VectorType; 4];
     // Load a single complex number from the array into a Neon vector, setting the unused elements to zero.
     unsafe fn load_partial1_complex(&self, index: usize) -> Self::VectorType;
     // Load a single complex number from the array, and copy it to all elements of a Neon vector.
@@ -144,6 +150,27 @@ impl NeonArray for RawSlice<Complex<f32>> {
     unsafe fn load_complex(&self, index: usize) -> Self::VectorType {
         debug_assert!(self.len() >= index + Self::COMPLEX_PER_VECTOR);
         vld1q_f32(self.as_ptr().add(index) as *const f32)
+    }
+
+    #[inline(always)]
+    unsafe fn load_interleave2_complex(&self, index: usize) -> [Self::VectorType; 2] {
+        debug_assert!(self.len() >= index + 2*Self::COMPLEX_PER_VECTOR);
+        let values = vld2q_f64(self.as_ptr().add(index) as *const f64);
+        [vreinterpretq_f32_f64(values.0), vreinterpretq_f32_f64(values.1)]
+    }
+
+    #[inline(always)]
+    unsafe fn load_interleave3_complex(&self, index: usize) -> [Self::VectorType; 3] {
+        debug_assert!(self.len() >= index + 3*Self::COMPLEX_PER_VECTOR);
+        let values = vld3q_f64(self.as_ptr().add(index) as *const f64);
+        [vreinterpretq_f32_f64(values.0), vreinterpretq_f32_f64(values.1), vreinterpretq_f32_f64(values.2)]
+    }
+
+    #[inline(always)]
+    unsafe fn load_interleave4_complex(&self, index: usize) -> [Self::VectorType; 4] {
+        debug_assert!(self.len() >= index + 4*Self::COMPLEX_PER_VECTOR);
+        let values = vld4q_f64(self.as_ptr().add(index) as *const f64);
+        [vreinterpretq_f32_f64(values.0), vreinterpretq_f32_f64(values.1), vreinterpretq_f32_f64(values.2), vreinterpretq_f32_f64(values.3)]
     }
 
     #[inline(always)]
@@ -176,6 +203,21 @@ impl NeonArray for RawSlice<Complex<f64>> {
     #[inline(always)]
     unsafe fn load_partial1_complex(&self, _index: usize) -> Self::VectorType {
         unimplemented!("Impossible to do a partial load of complex f64's");
+    }
+
+    #[inline(always)]
+    unsafe fn load_interleave2_complex(&self, _index: usize) -> [Self::VectorType; 2] {
+        unimplemented!("Interleaved loading not implemented for f64");
+    }
+
+    #[inline(always)]
+    unsafe fn load_interleave3_complex(&self, _index: usize) -> [Self::VectorType; 3] {
+        unimplemented!("Interleaved loading not implemented for f64");
+    }
+
+    #[inline(always)]
+    unsafe fn load_interleave4_complex(&self, _index: usize) -> [Self::VectorType; 4] {
+        unimplemented!("Interleaved loading not implemented for f64");
     }
 
     #[inline(always)]
