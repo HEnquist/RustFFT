@@ -291,10 +291,13 @@ impl<T: FftNum> NeonF32Butterfly2<T> {
         &self,
         mut buffer: impl NeonArrayMut<f32>,
     ) {
-        let values_a = buffer.load_complex(0);
-        let values_b = buffer.load_complex(2);
+        // let values_a = input.load_complex(0);
+        // let values_b = input.load_complex(2);
 
-        let out = self.perform_parallel_fft_direct(values_a, values_b);
+        // let out = self.perform_parallel_fft_direct(values_a, values_b);
+        let [values_a, values_b] = buffer.load_interleave2_complex(0);
+
+        let out = parallel_fft2_interleaved_f32(values_a, values_b);
 
         let [out02, out13] = transpose_complex_2x2_f32(out[0], out[1]);
 
@@ -458,13 +461,15 @@ impl<T: FftNum> NeonF32Butterfly3<T> {
         &self,
         mut buffer: impl NeonArrayMut<f32>,
     ) {
-        let valuea0a1 = buffer.load_complex(0);
-        let valuea2b0 = buffer.load_complex(2);
-        let valueb1b2 = buffer.load_complex(4);
+        // let valuea0a1 = input.load_complex(0);
+        // let valuea2b0 = input.load_complex(2);
+        // let valueb1b2 = input.load_complex(4);
 
-        let value0 = extract_lo_hi_f32(valuea0a1, valuea2b0);
-        let value1 = extract_hi_lo_f32(valuea0a1, valueb1b2);
-        let value2 = extract_lo_hi_f32(valuea2b0, valueb1b2);
+        // let value0 = extract_lo_hi_f32(valuea0a1, valuea2b0);
+        // let value1 = extract_hi_lo_f32(valuea0a1, valueb1b2);
+        // let value2 = extract_lo_hi_f32(valuea2b0, valueb1b2);
+
+        let [value0, value1, value2] = buffer.load_interleave3_complex(0);
 
         let out = self.perform_parallel_fft_direct(value0, value1, value2);
 

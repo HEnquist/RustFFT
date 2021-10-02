@@ -374,6 +374,12 @@ where
 pub trait NeonArrayMut<T: NeonNum>: NeonArray<T> + DerefMut {
     // Store all complex numbers from a Neon vector to the array.
     unsafe fn store_complex(&mut self, vector: T::VectorType, index: usize);
+    // Store all complex numbers from a Neon vector to the array.
+    unsafe fn store_interleave2_complex(&mut self, vectors: [T::VectorType; 2], index: usize);
+    // Store all complex numbers from a Neon vector to the array.
+    unsafe fn store_interleave3_complex(&mut self, vectors: [T::VectorType; 3], index: usize);
+    // Store all complex numbers from a Neon vector to the array.
+    unsafe fn store_interleave4_complex(&mut self, vectors: [T::VectorType; 4], index: usize);
     // Store the low complex number from a Neon vector to the array.
     unsafe fn store_partial_lo_complex(&mut self, vector: T::VectorType, index: usize);
     // Store the high complex number from a Neon vector to the array.
@@ -385,6 +391,51 @@ impl NeonArrayMut<f32> for &mut [Complex<f32>] {
     unsafe fn store_complex(&mut self, vector: <f32 as NeonNum>::VectorType, index: usize) {
         debug_assert!(self.len() >= index + <f32 as NeonNum>::COMPLEX_PER_VECTOR);
         vst1q_f32(self.as_mut_ptr().add(index) as *mut f32, vector);
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave2_complex(
+        &mut self,
+        vectors: [<f32 as NeonNum>::VectorType; 2],
+        index: usize,
+    ) {
+        debug_assert!(self.len() >= index + 2 * <f32 as NeonNum>::COMPLEX_PER_VECTOR);
+        let temp = float64x2x2_t(
+            vreinterpretq_f64_f32(vectors[0]),
+            vreinterpretq_f64_f32(vectors[1]),
+        );
+        vst2q_f64(self.as_mut_ptr().add(index) as *mut f64, temp);
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave3_complex(
+        &mut self,
+        vectors: [<f32 as NeonNum>::VectorType; 3],
+        index: usize,
+    ) {
+        debug_assert!(self.len() >= index + 3 * <f32 as NeonNum>::COMPLEX_PER_VECTOR);
+        let temp = float64x2x3_t(
+            vreinterpretq_f64_f32(vectors[0]),
+            vreinterpretq_f64_f32(vectors[1]),
+            vreinterpretq_f64_f32(vectors[2]),
+        );
+        vst3q_f64(self.as_mut_ptr().add(index) as *mut f64, temp);
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave4_complex(
+        &mut self,
+        vectors: [<f32 as NeonNum>::VectorType; 4],
+        index: usize,
+    ) {
+        debug_assert!(self.len() >= index + 4 * <f32 as NeonNum>::COMPLEX_PER_VECTOR);
+        let temp = float64x2x4_t(
+            vreinterpretq_f64_f32(vectors[0]),
+            vreinterpretq_f64_f32(vectors[1]),
+            vreinterpretq_f64_f32(vectors[2]),
+            vreinterpretq_f64_f32(vectors[3]),
+        );
+        vst4q_f64(self.as_mut_ptr().add(index) as *mut f64, temp);
     }
 
     #[inline(always)]
@@ -418,6 +469,33 @@ impl NeonArrayMut<f64> for &mut [Complex<f64>] {
     }
 
     #[inline(always)]
+    unsafe fn store_interleave2_complex(
+        &mut self,
+        _vectors: [<f64 as NeonNum>::VectorType; 2],
+        _index: usize,
+    ) {
+        unimplemented!("Interleaved storing not implemented for f64");
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave3_complex(
+        &mut self,
+        _vectors: [<f64 as NeonNum>::VectorType; 3],
+        _index: usize,
+    ) {
+        unimplemented!("Interleaved storing not implemented for f64");
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave4_complex(
+        &mut self,
+        _vectors: [<f64 as NeonNum>::VectorType; 4],
+        _index: usize,
+    ) {
+        unimplemented!("Interleaved storing not implemented for f64");
+    }
+
+    #[inline(always)]
     unsafe fn store_partial_hi_complex(
         &mut self,
         _vector: <f64 as NeonNum>::VectorType,
@@ -443,6 +521,21 @@ where
     #[inline(always)]
     unsafe fn store_complex(&mut self, vector: T::VectorType, index: usize) {
         self.output.store_complex(vector, index);
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave2_complex(&mut self, vector: [T::VectorType; 2], index: usize) {
+        self.output.store_interleave2_complex(vector, index);
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave3_complex(&mut self, vector: [T::VectorType; 3], index: usize) {
+        self.output.store_interleave3_complex(vector, index);
+    }
+
+    #[inline(always)]
+    unsafe fn store_interleave4_complex(&mut self, vector: [T::VectorType; 4], index: usize) {
+        self.output.store_interleave4_complex(vector, index);
     }
     #[inline(always)]
     unsafe fn store_partial_hi_complex(&mut self, vector: T::VectorType, index: usize) {
