@@ -291,18 +291,19 @@ impl<T: FftNum> NeonF32Butterfly2<T> {
         &self,
         mut buffer: impl NeonArrayMut<f32>,
     ) {
-        // let values_a = input.load_complex(0);
-        // let values_b = input.load_complex(2);
+        //let values_a = input.load_complex(0);
+        //let values_b = input.load_complex(2);
 
-        // let out = self.perform_parallel_fft_direct(values_a, values_b);
+        //let out = self.perform_parallel_fft_direct(values_a, values_b);
         let [values_a, values_b] = buffer.load_interleave2_complex(0);
 
         let out = parallel_fft2_interleaved_f32(values_a, values_b);
 
-        let [out02, out13] = transpose_complex_2x2_f32(out[0], out[1]);
+        //let [out02, out13] = transpose_complex_2x2_f32(out[0], out[1]);
 
-        buffer.store_complex(out02, 0);
-        buffer.store_complex(out13, 2);
+        //output.store_complex(out02, 0);
+        //output.store_complex(out13, 2);
+        buffer.store_interleave2_complex(out, 0);
     }
 
     // length 2 fft of x, given as [x0, x1]
@@ -314,14 +315,14 @@ impl<T: FftNum> NeonF32Butterfly2<T> {
 
     // dual length 2 fft of x and y, given as [x0, x1], [y0, y1]
     // result is [X0, Y0], [X1, Y1]
-    #[inline(always)]
-    pub(crate) unsafe fn perform_parallel_fft_direct(
-        &self,
-        values_x: float32x4_t,
-        values_y: float32x4_t,
-    ) -> [float32x4_t; 2] {
-        parallel_fft2_contiguous_f32(values_x, values_y)
-    }
+    //#[inline(always)]
+    //pub(crate) unsafe fn perform_parallel_fft_direct(
+    //    &self,
+    //    values_x: float32x4_t,
+    //    values_y: float32x4_t,
+    //) -> [float32x4_t; 2] {
+    //    parallel_fft2_contiguous_f32(values_x, values_y)
+    //}
 }
 
 // double lenth 2 fft of a and b, given as [x0, y0], [x1, y1]
@@ -473,13 +474,14 @@ impl<T: FftNum> NeonF32Butterfly3<T> {
 
         let out = self.perform_parallel_fft_direct(value0, value1, value2);
 
-        let out0 = extract_lo_lo_f32(out[0], out[1]);
-        let out1 = extract_lo_hi_f32(out[2], out[0]);
-        let out2 = extract_hi_hi_f32(out[1], out[2]);
-
-        buffer.store_complex(out0, 0);
-        buffer.store_complex(out1, 2);
-        buffer.store_complex(out2, 4);
+        //let out0 = extract_lo_lo_f32(out[0], out[1]);
+        //let out1 = extract_lo_hi_f32(out[2], out[0]);
+        //let out2 = extract_hi_hi_f32(out[1], out[2]);
+        //
+        //output.store_complex(out0, 0);
+        //output.store_complex(out1, 2);
+        //output.store_complex(out2, 4);
+        buffer.store_interleave3_complex(out, 0);
     }
 
     // length 3 fft of a, given as [x0, 0.0], [x1, x2]
@@ -663,13 +665,14 @@ impl<T: FftNum> NeonF32Butterfly4<T> {
 
         let out = self.perform_parallel_fft_direct(value0ab, value1ab, value2ab, value3ab);
 
-        let [out0, out1] = transpose_complex_2x2_f32(out[0], out[1]);
-        let [out2, out3] = transpose_complex_2x2_f32(out[2], out[3]);
+        //let [out0, out1] = transpose_complex_2x2_f32(out[0], out[1]); // ae bf -> ab ef
+        //let [out2, out3] = transpose_complex_2x2_f32(out[2], out[3]); // cg dh -> cd gh
 
-        buffer.store_complex(out0, 0);
-        buffer.store_complex(out1, 4);
-        buffer.store_complex(out2, 2);
-        buffer.store_complex(out3, 6);
+        //output.store_complex(out0, 0); // ab
+        //output.store_complex(out2, 2); // cd
+        //output.store_complex(out1, 4); // ef
+        //output.store_complex(out3, 6); // gh
+        buffer.store_interleave4_complex(out, 0);
     }
 
     // length 4 fft of a, given as [x0, x1], [x2, x3]
@@ -3320,11 +3323,11 @@ mod unit_tests {
 
             let dft = Dft::new(2, FftDirection::Forward);
 
-            let bf2 = NeonF32Butterfly2::<f32>::new(FftDirection::Forward);
+            //let bf2 = NeonF32Butterfly2::<f32>::new(FftDirection::Forward);
 
             dft.process(&mut val_a);
             dft.process(&mut val_b);
-            let res_both = bf2.perform_parallel_fft_direct(p1, p2);
+            let res_both = parallel_fft2_contiguous_f32(p1, p2);
 
             let res = std::mem::transmute::<[float32x4_t; 2], [Complex<f32>; 4]>(res_both);
             let neon_res_a = [res[0], res[2]];
