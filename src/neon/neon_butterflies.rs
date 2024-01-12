@@ -291,18 +291,10 @@ impl<T: FftNum> NeonF32Butterfly2<T> {
         &self,
         mut buffer: impl NeonArrayMut<f32>,
     ) {
-        //let values_a = input.load_complex(0);
-        //let values_b = input.load_complex(2);
-
-        //let out = self.perform_parallel_fft_direct(values_a, values_b);
         let [values_a, values_b] = buffer.load_interleave2_complex(0);
 
         let out = parallel_fft2_interleaved_f32(values_a, values_b);
 
-        //let [out02, out13] = transpose_complex_2x2_f32(out[0], out[1]);
-
-        //output.store_complex(out02, 0);
-        //output.store_complex(out13, 2);
         buffer.store_interleave2_complex(out, 0);
     }
 
@@ -462,25 +454,10 @@ impl<T: FftNum> NeonF32Butterfly3<T> {
         &self,
         mut buffer: impl NeonArrayMut<f32>,
     ) {
-        // let valuea0a1 = input.load_complex(0);
-        // let valuea2b0 = input.load_complex(2);
-        // let valueb1b2 = input.load_complex(4);
-
-        // let value0 = extract_lo_hi_f32(valuea0a1, valuea2b0);
-        // let value1 = extract_hi_lo_f32(valuea0a1, valueb1b2);
-        // let value2 = extract_lo_hi_f32(valuea2b0, valueb1b2);
-
         let [value0, value1, value2] = buffer.load_interleave3_complex(0);
 
         let out = self.perform_parallel_fft_direct(value0, value1, value2);
 
-        //let out0 = extract_lo_lo_f32(out[0], out[1]);
-        //let out1 = extract_lo_hi_f32(out[2], out[0]);
-        //let out2 = extract_hi_hi_f32(out[1], out[2]);
-        //
-        //output.store_complex(out0, 0);
-        //output.store_complex(out1, 2);
-        //output.store_complex(out2, 4);
         buffer.store_interleave3_complex(out, 0);
     }
 
@@ -653,25 +630,10 @@ impl<T: FftNum> NeonF32Butterfly4<T> {
         &self,
         mut buffer: impl NeonArrayMut<f32>,
     ) {
-        // let value01a = input.load_complex(0);
-        // let value23a = input.load_complex(2);
-        // let value01b = input.load_complex(4);
-        // let value23b = input.load_complex(6);
-
-        // let [value0ab, value1ab] = transpose_complex_2x2_f32(value01a, value01b);
-        // let [value2ab, value3ab] = transpose_complex_2x2_f32(value23a, value23b);
-
         let [value0ab, value1ab, value2ab, value3ab] = buffer.load_interleave4_complex(0);
 
         let out = self.perform_parallel_fft_direct(value0ab, value1ab, value2ab, value3ab);
 
-        //let [out0, out1] = transpose_complex_2x2_f32(out[0], out[1]); // ae bf -> ab ef
-        //let [out2, out3] = transpose_complex_2x2_f32(out[2], out[3]); // cg dh -> cd gh
-
-        //output.store_complex(out0, 0); // ab
-        //output.store_complex(out2, 2); // cd
-        //output.store_complex(out1, 4); // ef
-        //output.store_complex(out3, 6); // gh
         buffer.store_interleave4_complex(out, 0);
     }
 

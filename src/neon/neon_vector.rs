@@ -524,18 +524,18 @@ where
     }
 
     #[inline(always)]
-    unsafe fn store_interleave2_complex(&mut self, vector: [T::VectorType; 2], index: usize) {
-        self.output.store_interleave2_complex(vector, index);
+    unsafe fn store_interleave2_complex(&mut self, vectors: [T::VectorType; 2], index: usize) {
+        self.output.store_interleave2_complex(vectors, index);
     }
 
     #[inline(always)]
-    unsafe fn store_interleave3_complex(&mut self, vector: [T::VectorType; 3], index: usize) {
-        self.output.store_interleave3_complex(vector, index);
+    unsafe fn store_interleave3_complex(&mut self, vectors: [T::VectorType; 3], index: usize) {
+        self.output.store_interleave3_complex(vectors, index);
     }
 
     #[inline(always)]
-    unsafe fn store_interleave4_complex(&mut self, vector: [T::VectorType; 4], index: usize) {
-        self.output.store_interleave4_complex(vector, index);
+    unsafe fn store_interleave4_complex(&mut self, vectors: [T::VectorType; 4], index: usize) {
+        self.output.store_interleave4_complex(vectors, index);
     }
     #[inline(always)]
     unsafe fn store_partial_hi_complex(&mut self, vector: T::VectorType, index: usize) {
