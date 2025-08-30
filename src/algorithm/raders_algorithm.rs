@@ -91,8 +91,7 @@ impl<T: FftNum> RadersAlgorithm<T> {
             let twiddle = twiddles::compute_twiddle(twiddle_input, len, direction);
             *input_cell = twiddle * inner_fft_scale;
 
-            twiddle_input =
-                ((twiddle_input as u64 * primitive_root_inverse as u64) % len as u64) as usize;
+            twiddle_input = (twiddle_input * primitive_root_inverse) % reduced_len;
         }
 
         let required_inner_scratch = inner_fft.get_inplace_scratch_len();
