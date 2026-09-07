@@ -13,7 +13,7 @@
 mod emit;
 mod model;
 
-use model::{kind, overhead_scale, Model};
+use model::{bucket_of, kind, overhead_scale, Model};
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
 use rustfft::tuning::{
@@ -330,7 +330,7 @@ fn fit_overheads<T: FftNum>(
     rounds: usize,
     block_ms: f64,
     cap: usize,
-) {
+) -> Vec<(std::sync::Arc<Recipe>, f64)> {
     let mut samples: Vec<(std::sync::Arc<Recipe>, f64)> = Vec::new();
     for &len in lengths {
         let mut tuner = NeonTuner::<T>::new();
@@ -350,34 +350,53 @@ fn fit_overheads<T: FftNum>(
 
     let mut fitted: Vec<&'static str> = Vec::new();
     for target in ["mrs", "gts", "mr", "gt", "rad", "bs"] {
-        let residuals: Vec<f64> = samples
+        let usable: Vec<(u32, f64)> = samples
             .iter()
             .filter(|(recipe, _)| kind(recipe) == target && model.descendants_known(recipe, &fitted))
             .filter_map(|(recipe, measured)| {
                 model
                     .inner_cost(recipe)
-                    .map(|inner| (measured - inner) / overhead_scale(recipe))
+                    .map(|inner| (bucket_of(recipe), (measured - inner) / overhead_scale(recipe)))
             })
             .collect();
-        if residuals.is_empty() {
+        if usable.is_empty() {
             eprintln!("warning: no calibration samples for '{}'", target);
             continue;
         }
-        let count = residuals.len();
-        let mut sorted = residuals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let value = median_of(residuals);
+
+        // One median per log2 bucket, but only for buckets with enough samples to mean
+        // anything. Sparse buckets are dropped and filled in by interpolation instead.
+        let mut by_bucket: std::collections::BTreeMap<u32, Vec<f64>> = Default::default();
+        for (bucket, residual) in usable.iter() {
+            by_bucket.entry(*bucket).or_default().push(*residual);
+        }
+        const MIN_PER_BUCKET: usize = 3;
+        let mut table: Vec<(u32, f64)> = by_bucket
+            .iter()
+            .filter(|(_, values)| values.len() >= MIN_PER_BUCKET)
+            .map(|(bucket, values)| (*bucket, median_of(values.clone())))
+            .collect();
+
+        // Too little data to describe a curve, so fall back to one constant for this kind.
+        if table.len() < 2 {
+            table = vec![(0, median_of(usable.iter().map(|(_, r)| *r).collect()))];
+        }
+
+        let rendered: Vec<String> = table
+            .iter()
+            .map(|(bucket, value)| format!("{}:{:.2}", 1usize << bucket, value))
+            .collect();
         println!(
-            "  {:<5} {:>8.4} ns/element   p25 {:>7.4}  p75 {:>7.4}  ({} samples)",
+            "  {:<5} {:>3} buckets from {:>4} samples   {}",
             target,
-            value,
-            sorted[count / 4],
-            sorted[(count * 3) / 4],
-            count
+            table.len(),
+            usable.len(),
+            rendered.join(" ")
         );
-        model.overhead.insert(target, value);
+        model.overhead.insert(target, table);
         fitted.push(target);
     }
+    samples
 }
 
 
@@ -459,6 +478,57 @@ fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], c
     }
 }
 
+
+/// Show how each algorithm's per-element overhead varies with size.
+///
+/// The model charges one constant per element per algorithm. That is only right if the constant
+/// really is constant. GoodThomas and Rader's both reindex with a scatter rather than a
+/// transpose, so their per-element cost has every reason to grow once the working set stops
+/// fitting in cache, and if it does, a single number cannot express it.
+fn cmd_residuals<T: FftNum>(lengths: &[usize], rounds: usize, block_ms: f64, cap: usize) {
+    let max_len = lengths.iter().copied().max().unwrap_or(1024) * 4;
+    eprintln!("measuring primitives...");
+    let mut model = calibrate_primitives::<T>(rounds, block_ms, max_len);
+    eprintln!("fitting overheads...");
+    let samples = fit_overheads::<T>(&mut model, lengths, rounds, block_ms, cap);
+
+    // kind -> log2 bucket -> residuals
+    let mut binned: std::collections::BTreeMap<&'static str, std::collections::BTreeMap<u32, Vec<f64>>> =
+        Default::default();
+    for (recipe, measured) in samples.iter() {
+        let k = kind(recipe);
+        if !matches!(k, "mr" | "mrs" | "gt" | "gts" | "rad" | "bs") {
+            continue;
+        }
+        if let Some(inner) = model.inner_cost(recipe) {
+            let residual = (measured - inner) / overhead_scale(recipe);
+            let bucket = (recipe.len() as f64).log2() as u32;
+            binned.entry(k).or_default().entry(bucket).or_default().push(residual);
+        }
+    }
+
+    println!("{:<5} {:>8} {:>8} {:>9} {:>7}", "kind", "len>=", "median", "p25..p75", "n");
+    for (kind, buckets) in binned {
+        for (bucket, values) in buckets {
+            if values.len() < 3 {
+                continue;
+            }
+            let mut sorted = values.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = sorted.len();
+            println!(
+                "{:<5} {:>8} {:>8.3} {:>9} {:>7}",
+                kind,
+                1usize << bucket,
+                sorted[n / 2],
+                format!("{:.2}..{:.2}", sorted[n / 4], sorted[(n * 3) / 4]),
+                n
+            );
+        }
+        println!();
+    }
+}
+
 fn cmd_model<T: FftNum>(
     train: &[usize],
     test: &[usize],
@@ -494,8 +564,16 @@ fn cmd_model<T: FftNum>(
             .collect();
         measure(&mut subjects, rounds, block_ms);
 
-        let best_time = subjects.iter().map(|s| s.best()).fold(f64::INFINITY, f64::min);
-        let planner_time = subjects[0].best();
+        let planner_time_pass1 = subjects[0].best();
+        let _ = planner_time_pass1;
+
+        // Fastest of the first pass, used only to pick which recipes deserve a careful re-timing.
+        let best_index = subjects
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.best().partial_cmp(&b.1.best()).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
 
         let model_index = candidates
             .iter()
@@ -504,9 +582,45 @@ fn cmd_model<T: FftNum>(
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .map(|(i, _)| i);
 
-        let (model_time, model_spec) = match model_index {
-            Some(i) => (subjects[i].best(), subjects[i].name.clone()),
-            None => (f64::NAN, "<no candidate priced>".to_string()),
+        let model_spec = match model_index {
+            Some(i) => subjects[i].name.clone(),
+            None => "<no candidate priced>".to_string(),
+        };
+
+        // Second pass. The winner of a 48-way comparison is biased fast: with sub-percent
+        // noise, the minimum of many draws lands below the true minimum, which puts a floor
+        // under any regret measured against it. Re-timing just the three recipes of interest,
+        // for longer, removes most of that bias and shows whether the model is actually behind
+        // the best or merely behind the luckiest measurement.
+        let finalists: Vec<usize> = {
+            let mut picked = vec![0usize, best_index];
+            if let Some(i) = model_index {
+                picked.push(i);
+            }
+            picked.sort_unstable();
+            picked.dedup();
+            picked
+        };
+        let mut finals: Vec<Subject<T>> = finalists
+            .iter()
+            .map(|&i| {
+                let fft = tuner.build(&candidates[i], FftDirection::Forward);
+                Subject::new(to_spec(&candidates[i]), fft, 1)
+            })
+            .collect();
+        measure(&mut finals, rounds * 4, block_ms);
+
+        let time_of = |index: usize| -> f64 {
+            finals[finalists.iter().position(|&i| i == index).unwrap()].best()
+        };
+        let planner_time = time_of(0);
+        let best_time = finalists
+            .iter()
+            .map(|&i| time_of(i))
+            .fold(f64::INFINITY, f64::min);
+        let model_time = match model_index {
+            Some(i) => time_of(i),
+            None => f64::NAN,
         };
 
         let model_regret = model_time / best_time;
@@ -605,6 +719,17 @@ fn main() {
                 cmd_regret::<f32>(&lengths, rounds, block_ms, verbose, cap)
             } else {
                 cmd_regret::<f64>(&lengths, rounds, block_ms, verbose, cap)
+            }
+        }
+        "residuals" => {
+            let lengths: Vec<usize> = rest
+                .iter()
+                .map(|s| s.parse().expect("lengths must be numbers"))
+                .collect();
+            if f32_mode {
+                cmd_residuals::<f32>(&lengths, rounds, block_ms, cap)
+            } else {
+                cmd_residuals::<f64>(&lengths, rounds, block_ms, cap)
             }
         }
         "emit" => {

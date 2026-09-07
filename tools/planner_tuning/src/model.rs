@@ -66,17 +66,61 @@ pub fn children(recipe: &Recipe) -> Vec<&Recipe> {
     }
 }
 
+/// Which log2 bucket a recipe's overhead belongs in.
+///
+/// Bucketed on the same quantity the overhead is charged per, so that Bluestein's is placed by
+/// the padded inner length it actually works over.
+pub fn bucket_of(recipe: &Recipe) -> u32 {
+    overhead_scale(recipe).log2() as u32
+}
+
 #[derive(Default, Clone)]
 pub struct Model {
     /// Measured nanoseconds for one FFT, by butterfly length.
     pub butterfly: HashMap<usize, f64>,
     /// Measured nanoseconds for one FFT, by (base length, k).
     pub radix4: HashMap<(usize, u32), f64>,
-    /// Fitted nanoseconds per element of overhead, by algorithm kind.
-    pub overhead: HashMap<&'static str, f64>,
+    /// Fitted nanoseconds per element of overhead, by algorithm kind, as a curve over log2 of
+    /// the working set. A single constant is not enough: GoodThomas reindexes with a scatter
+    /// rather than a transpose, and its per-element cost roughly triples once the array stops
+    /// fitting in L1. Entries are sorted by bucket.
+    pub overhead: HashMap<&'static str, Vec<(u32, f64)>>,
 }
 
 impl Model {
+    /// Overhead per element for `kind` at a working set of `scale` elements, linearly
+    /// interpolated between measured buckets and clamped outside the measured range.
+    pub fn overhead_at(&self, kind: &str, scale: f64) -> Option<f64> {
+        let table = self.overhead.get(kind)?;
+        match table.len() {
+            0 => None,
+            1 => Some(table[0].1),
+            _ => {
+                let x = scale.log2();
+                if x <= table[0].0 as f64 {
+                    return Some(table[0].1);
+                }
+                if x >= table[table.len() - 1].0 as f64 {
+                    return Some(table[table.len() - 1].1);
+                }
+                for pair in table.windows(2) {
+                    let (lo_bucket, lo_value) = pair[0];
+                    let (hi_bucket, hi_value) = pair[1];
+                    if x <= hi_bucket as f64 {
+                        let span = (hi_bucket - lo_bucket) as f64;
+                        let t = if span > 0.0 {
+                            (x - lo_bucket as f64) / span
+                        } else {
+                            0.0
+                        };
+                        return Some(lo_value + t * (hi_value - lo_value));
+                    }
+                }
+                Some(table[table.len() - 1].1)
+            }
+        }
+    }
+
     /// Estimated nanoseconds for one FFT of this recipe.
     ///
     /// Returns `None` if the recipe uses a primitive that was never measured, so that a missing
@@ -110,18 +154,19 @@ impl Model {
             } => {
                 let left = self.cost(left_fft)?;
                 let right = self.cost(right_fft)?;
+                let scale = overhead_scale(recipe);
                 right_fft.len() as f64 * left
                     + left_fft.len() as f64 * right
-                    + self.overhead.get(kind(recipe))? * overhead_scale(recipe)
+                    + self.overhead_at(kind(recipe), scale)? * scale
             }
             // Rader's runs its inner FFT twice per transform, once forward and once to
             // invert the convolution, exactly like Bluestein's.
             Recipe::RadersAlgorithm { inner_fft } => {
-                2.0 * self.cost(inner_fft)? + self.overhead.get("rad")? * len
+                2.0 * self.cost(inner_fft)? + self.overhead_at("rad", len)? * len
             }
             Recipe::BluesteinsAlgorithm { inner_fft, .. } => {
-                2.0 * self.cost(inner_fft)?
-                    + self.overhead.get("bs")? * overhead_scale(recipe)
+                let scale = overhead_scale(recipe);
+                2.0 * self.cost(inner_fft)? + self.overhead_at("bs", scale)? * scale
             }
             butterfly => *self.butterfly.get(&butterfly.len())?,
         })
@@ -170,16 +215,20 @@ impl Model {
     }
 
     pub fn describe(&self) -> String {
-        let mut kinds: Vec<(&&str, &f64)> = self.overhead.iter().collect();
+        let mut kinds: Vec<(&&str, &Vec<(u32, f64)>)> = self.overhead.iter().collect();
         kinds.sort_by_key(|(k, _)| **k);
         let mut out = format!(
             "{} butterflies, {} radix4 shapes measured\n",
             self.butterfly.len(),
             self.radix4.len()
         );
-        out.push_str("overhead, ns per element:\n");
-        for (kind, value) in kinds {
-            out.push_str(&format!("  {:<5} {:>8.4}\n", kind, value));
+        out.push_str("overhead, ns per element, by working set:\n");
+        for (kind, table) in kinds {
+            let rendered: Vec<String> = table
+                .iter()
+                .map(|(bucket, value)| format!("{}:{:.2}", 1usize << bucket, value))
+                .collect();
+            out.push_str(&format!("  {:<5} {}\n", kind, rendered.join("  ")));
         }
         out
     }

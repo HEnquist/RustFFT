@@ -45,7 +45,12 @@ pub fn emit(model: &Model, element_type: &str) -> String {
     }
     out.push_str("];\n\n");
 
-    out.push_str("/// Fitted overhead per element, by algorithm.\n");
+    out.push_str(
+        "/// Fitted overhead per element, as (log2 of working set, cost), to be interpolated.\n\
+         ///\n\
+         /// These are curves rather than constants because the scattered reindexing in\n\
+         /// GoodThomas and Rader's costs sharply more once the array outgrows L1.\n",
+    );
     for (name, key) in [
         ("MIXEDRADIX", "mr"),
         ("MIXEDRADIX_SMALL", "mrs"),
@@ -54,14 +59,18 @@ pub fn emit(model: &Model, element_type: &str) -> String {
         ("RADERS", "rad"),
         ("BLUESTEINS", "bs"),
     ] {
-        let value = model
+        let table = model
             .overhead
             .get(key)
             .unwrap_or_else(|| panic!("overhead '{}' was never fitted", key));
+        let entries: Vec<String> = table
+            .iter()
+            .map(|(bucket, value)| format!("({}, {:.6})", bucket, value / unit))
+            .collect();
         out.push_str(&format!(
-            "pub(crate) const {}_OVERHEAD: f32 = {:.6};\n",
+            "pub(crate) const {}_OVERHEAD: &[(u32, f32)] = &[{}];\n",
             name,
-            value / unit
+            entries.join(", ")
         ));
     }
     out
