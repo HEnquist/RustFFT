@@ -722,6 +722,8 @@ fn dispatch<T: FftNum + ToPrimitive>(planner: &str, command: &Command, opts: &Op
         "neon" => run::<T, rustfft::tuning::NeonTuner<T>>(command, opts, el),
         #[cfg(target_arch = "x86_64")]
         "sse" => run::<T, rustfft::tuning::SseTuner<T>>(command, opts, el),
+        #[cfg(target_arch = "wasm32")]
+        "wasm_simd" => run::<T, rustfft::tuning::WasmSimdTuner<T>>(command, opts, el),
         other => {
             eprintln!(
                 "unknown or unavailable planner '{}' on this build; try 'scalar'",
