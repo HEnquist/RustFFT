@@ -32,6 +32,10 @@ sse = []
 neon = []
 wasm_simd = []
 
+# Internal, not part of the public API and not covered by semver. Exposes planner internals so
+# that the measurement tools under tools/ can build and enumerate recipes directly.
+tuning = []
+
 
 [dependencies]
 num-complex = "0.4"

@@ -517,6 +517,11 @@ mod neon {
 
 pub use self::neon::neon_planner::FftPlannerNeon;
 
+// Internal support for the planner-tuning tools. Not part of the public API.
+#[cfg(all(target_arch = "aarch64", feature = "neon", feature = "tuning"))]
+#[doc(hidden)]
+pub mod tuning;
+
 #[cfg(all(target_arch = "wasm32", feature = "wasm_simd"))]
 mod wasm_simd;
 
