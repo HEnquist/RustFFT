@@ -1,0 +1,13 @@
+[package]
+name = "planner_tuning"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustfft = { path = "../..", default-features = false, features = ["neon", "tuning"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
