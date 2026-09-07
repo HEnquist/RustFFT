@@ -1,23 +1,26 @@
-//! Measurement tool for the Neon planner.
+//! Measurement tool for RustFFT's planners.
 //!
-//! Two subcommands:
+//! Works against any planner that implements `TunablePlanner`, selected with `--planner`.
+//! Recipes are built through the planner's own internals, so what is measured here is exactly
+//! what the planner would construct.
 //!
-//!   time SPEC...      time recipes against each other, eg 'r4(2,b16)' 'mr(b32,b32)'
-//!                     a spec may carry a '*reps' suffix to run it over a len*reps buffer
-//!   regret LEN...     for each length, enumerate candidate recipes, measure them all, and
-//!                     report how far the shipping planner's pick is from the best available
-//!
-//! Recipes are built through rustfft's own planner internals, so what is measured here is
-//! exactly what the planner would construct.
+//! Subcommands:
+//!   time SPEC...              time recipes against each other; a '*reps' suffix runs a recipe
+//!                             over a len*reps buffer, which is how inner FFTs are invoked
+//!   regret LEN...             measure how far the planner's pick is from the best available
+//!   model TRAIN... 0 TEST...  calibrate a cost model and score its picks the same way
+//!   residuals LEN...          show how per-element overhead varies with working set
+//!   verify LEN...             check every enumerated candidate against a direct DFT
+//!   emit LEN...               print the fitted model as a Rust source file
 
 mod emit;
 mod model;
 
-use model::{bucket_of, kind, overhead_scale, Model};
+use model::{bucket_of, overhead_scale, Model, FIT_ORDER};
 use rustfft::num_complex::Complex;
-use rustfft::num_traits::Zero;
+use rustfft::num_traits::{ToPrimitive, Zero};
 use rustfft::tuning::{
-    butterfly_lens, parse, radix4_shapes, to_spec, NeonTuner, Recipe,
+    candidates_capped, parse, to_spec_string, ScalarTuner, Spec, TunablePlanner,
 };
 use rustfft::{Fft, FftDirection, FftNum};
 use std::sync::Arc;
@@ -50,17 +53,6 @@ impl<T: FftNum> Subject<T> {
         }
     }
 
-    fn placeholder() -> Self {
-        Subject {
-            name: String::new(),
-            fft: std::sync::Arc::new(rustfft::algorithm::Dft::new(1, FftDirection::Forward)),
-            reps: 1,
-            buffer: Vec::new(),
-            scratch: Vec::new(),
-            rounds: vec![f64::INFINITY],
-        }
-    }
-
     /// Wall-clock nanoseconds for `iters` passes over the whole buffer.
     fn time_block(&mut self, iters: usize) -> f64 {
         let start = Instant::now();
@@ -69,6 +61,12 @@ impl<T: FftNum> Subject<T> {
                 .process_with_scratch(&mut self.buffer, &mut self.scratch);
         }
         start.elapsed().as_secs_f64() * 1e9
+    }
+
+    /// Nanoseconds per individual FFT, ie per chunk of `fft.len()`.
+    fn time_per_fft(&mut self, iters: usize) -> f64 {
+        let reps = self.reps;
+        self.time_block(iters) / (iters * reps) as f64
     }
 
     fn best(&self) -> f64 {
@@ -84,9 +82,9 @@ impl<T: FftNum> Subject<T> {
 
 /// Time a set of subjects against each other, round-robin.
 ///
-/// Round-robin rather than one-at-a-time so that any drift over the run hits every subject
-/// equally, and min-of-rounds rather than a mean because the quantity of interest is the cost
-/// with nothing else interfering.
+/// Round-robin rather than one at a time so any drift over the run hits every subject equally,
+/// and min-of-rounds rather than a mean because the quantity of interest is the cost with
+/// nothing else interfering.
 fn measure<T: FftNum>(subjects: &mut [Subject<T>], rounds: usize, block_ms: f64) {
     let iters: Vec<usize> = subjects
         .iter_mut()
@@ -102,8 +100,7 @@ fn measure<T: FftNum>(subjects: &mut [Subject<T>], rounds: usize, block_ms: f64)
 
     for _ in 0..rounds {
         for (subject, &n) in subjects.iter_mut().zip(iters.iter()) {
-            let total = subject.time_block(n);
-            let per_fft = total / (n * subject.reps) as f64;
+            let per_fft = subject.time_per_fft(n);
             subject.rounds.push(per_fft);
         }
     }
@@ -125,29 +122,185 @@ fn request_performance_core() {
 #[cfg(not(target_os = "macos"))]
 fn request_performance_core() {}
 
+fn median_of(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values[values.len() / 2]
+}
+
+// ---------------------------------------------------------------------------
+// Calibration
+// ---------------------------------------------------------------------------
+
+/// Measure every primitive the model needs: each butterfly, and each valid Radix4 shape.
+///
+/// Each is timed over a buffer of at least 8192 elements, because primitives are almost always
+/// invoked many times over a larger buffer rather than standalone, and a single cold call would
+/// price in a startup cost they do not really pay in use.
+fn calibrate_primitives<T: FftNum, P: TunablePlanner<T>>(
+    rounds: usize,
+    block_ms: f64,
+    max_len: usize,
+) -> Model {
+    const REFERENCE_ELEMENTS: usize = 8192;
+    let mut planner = P::new();
+    let mut model = Model::default();
+
+    let mut shapes: Vec<Option<(usize, u32)>> = Vec::new();
+    let mut subjects: Vec<Subject<T>> = Vec::new();
+
+    for len in P::butterfly_lens() {
+        let spec = Spec::Butterfly(len);
+        let fft = planner.build(&spec, FftDirection::Forward);
+        let reps = (REFERENCE_ELEMENTS / len).max(1);
+        shapes.push(None);
+        subjects.push(Subject::new(format!("b{}", len), fft, reps));
+    }
+
+    for base in P::radix4_bases() {
+        let mut k = 1u32;
+        while base * (1usize << (2 * k)) <= max_len {
+            let spec = Spec::Radix4 {
+                k,
+                base: Arc::new(Spec::Butterfly(base)),
+            };
+            let len = spec.len();
+            let fft = planner.build(&spec, FftDirection::Forward);
+            let reps = (REFERENCE_ELEMENTS / len).max(1);
+            shapes.push(Some((base, k)));
+            subjects.push(Subject::new(to_spec_string(&spec), fft, reps));
+            k += 1;
+        }
+    }
+
+    measure(&mut subjects, rounds, block_ms);
+
+    for (shape, subject) in shapes.iter().zip(subjects.iter()) {
+        match shape {
+            Some(key) => {
+                model.radix4.insert(*key, subject.best());
+            }
+            None => {
+                model.butterfly.insert(subject.fft.len(), subject.best());
+            }
+        }
+    }
+    model
+}
+
+/// Fit one overhead curve for each composing algorithm.
+///
+/// Kinds are fitted in dependency order, since the residual of a MixedRadix that contains a
+/// MixedRadixSmall only means anything once the Small's own overhead is known.
+fn fit_overheads<T: FftNum, P: TunablePlanner<T>>(
+    model: &mut Model,
+    lengths: &[usize],
+    rounds: usize,
+    block_ms: f64,
+    cap: usize,
+    bucketed: bool,
+) -> Vec<(Arc<Spec>, f64)> {
+    let mut samples: Vec<(Arc<Spec>, f64)> = Vec::new();
+    for &len in lengths {
+        let mut planner = P::new();
+        let specs = candidates_capped(&mut planner, len, cap);
+        let mut subjects: Vec<Subject<T>> = specs
+            .iter()
+            .map(|spec| {
+                let fft = planner.build(spec, FftDirection::Forward);
+                Subject::new(to_spec_string(spec), fft, 1)
+            })
+            .collect();
+        measure(&mut subjects, rounds, block_ms);
+        for (spec, subject) in specs.iter().zip(subjects.iter()) {
+            samples.push((Arc::clone(spec), subject.best()));
+        }
+    }
+
+    let mut fitted: Vec<&'static str> = Vec::new();
+    for target in FIT_ORDER {
+        let usable: Vec<(u32, f64)> = samples
+            .iter()
+            .filter(|(spec, _)| spec.kind() == target && model.descendants_known(spec, &fitted))
+            .filter_map(|(spec, measured)| {
+                model
+                    .inner_cost(spec)
+                    .map(|inner| (bucket_of(spec), (measured - inner) / overhead_scale(spec)))
+            })
+            .collect();
+        if usable.is_empty() {
+            eprintln!("warning: no calibration samples for '{}'", target);
+            continue;
+        }
+
+        // One median per log2 bucket, but only for buckets with enough samples to mean anything.
+        // Sparse buckets are dropped and filled in by interpolation instead.
+        let mut table: Vec<(u32, f64)> = Vec::new();
+        if bucketed {
+            let mut by_bucket: std::collections::BTreeMap<u32, Vec<f64>> = Default::default();
+            for (bucket, residual) in usable.iter() {
+                by_bucket.entry(*bucket).or_default().push(*residual);
+            }
+            const MIN_PER_BUCKET: usize = 3;
+            table = by_bucket
+                .iter()
+                .filter(|(_, values)| values.len() >= MIN_PER_BUCKET)
+                .map(|(bucket, values)| (*bucket, median_of(values.clone())))
+                .collect();
+        }
+
+        // Too little data to describe a curve, or curves not wanted, so use one constant.
+        if table.len() < 2 {
+            table = vec![(0, median_of(usable.iter().map(|(_, r)| *r).collect()))];
+        }
+
+        let rendered: Vec<String> = table
+            .iter()
+            .map(|(bucket, value)| format!("{}:{:.2}", 1usize << bucket, value))
+            .collect();
+        println!(
+            "  {:<5} {:>3} buckets from {:>4} samples   {}",
+            target,
+            table.len(),
+            usable.len(),
+            rendered.join(" ")
+        );
+        model.overhead.insert(target, table);
+        fitted.push(target);
+    }
+    samples
+}
+
 // ---------------------------------------------------------------------------
 // Subcommands
 // ---------------------------------------------------------------------------
 
-fn cmd_time<T: FftNum>(specs: &[String], rounds: usize, block_ms: f64) {
-    let mut tuner = NeonTuner::<T>::new();
+struct Options {
+    rounds: usize,
+    block_ms: f64,
+    cap: usize,
+    verbose: bool,
+    bucketed: bool,
+}
+
+fn cmd_time<T: FftNum, P: TunablePlanner<T>>(specs: &[String], opts: &Options) {
+    let mut planner = P::new();
     let mut subjects: Vec<Subject<T>> = specs
         .iter()
-        .map(|spec| {
-            let (recipe_spec, reps) = match spec.rsplit_once('*') {
-                Some((recipe, reps)) => (recipe, reps.parse().expect("bad repeat count")),
-                None => (spec.as_str(), 1usize),
+        .map(|text| {
+            let (spec_text, reps) = match text.rsplit_once('*') {
+                Some((spec, reps)) => (spec, reps.parse().expect("bad repeat count")),
+                None => (text.as_str(), 1usize),
             };
-            let recipe = parse(recipe_spec).unwrap_or_else(|e| {
-                eprintln!("error in spec '{}': {}", recipe_spec, e);
+            let spec = parse(spec_text).unwrap_or_else(|e| {
+                eprintln!("error in spec '{}': {}", spec_text, e);
                 std::process::exit(2);
             });
-            let fft = tuner.build(&recipe, FftDirection::Forward);
-            Subject::new(spec.clone(), fft, reps)
+            let fft = planner.build(&spec, FftDirection::Forward);
+            Subject::new(text.clone(), fft, reps)
         })
         .collect();
 
-    measure(&mut subjects, rounds, block_ms);
+    measure(&mut subjects, opts.rounds, opts.block_ms);
 
     println!(
         "{:<46} {:>9} {:>7} {:>13} {:>9}",
@@ -177,13 +330,7 @@ fn cmd_time<T: FftNum>(specs: &[String], rounds: usize, block_ms: f64) {
     }
 }
 
-fn cmd_regret<T: FftNum>(
-    lengths: &[usize],
-    rounds: usize,
-    block_ms: f64,
-    verbose: bool,
-    cap: usize,
-) {
+fn cmd_regret<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
     println!(
         "{:>9} {:>8} {:>10} {:>10}  {}",
         "len", "regret", "planner ns", "best ns", "best recipe (when it differs)"
@@ -192,19 +339,19 @@ fn cmd_regret<T: FftNum>(
     let mut regrets: Vec<(f64, usize, String, String)> = Vec::new();
 
     for &len in lengths {
-        let mut tuner = NeonTuner::<T>::new();
-        let candidates = tuner.candidates_capped(len, cap);
-        let planner_spec = to_spec(&candidates[0]);
+        let mut planner = P::new();
+        let specs = candidates_capped(&mut planner, len, opts.cap);
+        let planner_spec = to_spec_string(&specs[0]);
 
-        let mut subjects: Vec<Subject<T>> = candidates
+        let mut subjects: Vec<Subject<T>> = specs
             .iter()
-            .map(|recipe| {
-                let fft = tuner.build(recipe, FftDirection::Forward);
-                Subject::new(to_spec(recipe), fft, 1)
+            .map(|spec| {
+                let fft = planner.build(spec, FftDirection::Forward);
+                Subject::new(to_spec_string(spec), fft, 1)
             })
             .collect();
 
-        measure(&mut subjects, rounds, block_ms);
+        measure(&mut subjects, opts.rounds, opts.block_ms);
 
         let planner_time = subjects[0].best();
         let best_index = subjects
@@ -229,7 +376,7 @@ fn cmd_regret<T: FftNum>(
                 best_spec.clone()
             }
         );
-        if verbose {
+        if opts.verbose {
             let mut ranked: Vec<&Subject<T>> = subjects.iter().collect();
             ranked.sort_by(|a, b| a.best().partial_cmp(&b.best()).unwrap());
             for subject in ranked.iter().take(6) {
@@ -255,10 +402,7 @@ fn cmd_regret<T: FftNum>(
     println!("  p90      {:.4}", regrets[(n * 9) / 10].0);
     println!("  worst    {:.4}", regrets[n - 1].0);
     let losing = regrets.iter().filter(|r| r.0 > 1.02).count();
-    println!(
-        "  more than 2% off the best: {} of {} lengths",
-        losing, n
-    );
+    println!("  more than 2% off the best: {} of {} lengths", losing, n);
     println!("\nworst offenders:");
     for (regret, len, planner_spec, best_spec) in regrets.iter().rev().take(10) {
         println!("  {:>8}  {:.3}x", len, regret);
@@ -267,145 +411,11 @@ fn cmd_regret<T: FftNum>(
     }
 }
 
-
-fn median_of(mut values: Vec<f64>) -> f64 {
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    values[values.len() / 2]
-}
-
-/// Measure every primitive the model needs: each butterfly, and each valid Radix4 shape.
-///
-/// Each is timed over a buffer of at least 8192 elements, because primitives are almost always
-/// invoked many times over a larger buffer rather than standalone, and a single cold call would
-/// price in a startup cost they do not really pay in use.
-fn calibrate_primitives<T: FftNum>(rounds: usize, block_ms: f64, max_len: usize) -> Model {
-    const REFERENCE_ELEMENTS: usize = 8192;
-    let mut tuner = NeonTuner::<T>::new();
-    let mut model = Model::default();
-
-    let mut subjects: Vec<(String, usize, Option<(usize, u32)>, Subject<T>)> = Vec::new();
-    for len in butterfly_lens() {
-        let recipe = parse(&format!("b{}", len)).expect("butterfly spec");
-        let fft = tuner.build(&recipe, FftDirection::Forward);
-        let reps = (REFERENCE_ELEMENTS / len).max(1);
-        subjects.push((
-            format!("b{}", len),
-            len,
-            None,
-            Subject::new(format!("b{}", len), fft, reps),
-        ));
-    }
-    for (base, k) in radix4_shapes::<T>(max_len) {
-        let spec = format!("r4({},b{})", k, base);
-        let recipe = parse(&spec).expect("radix4 spec");
-        let len = recipe.len();
-        let fft = tuner.build(&recipe, FftDirection::Forward);
-        let reps = (REFERENCE_ELEMENTS / len).max(1);
-        subjects.push((spec.clone(), len, Some((base, k)), Subject::new(spec, fft, reps)));
-    }
-
-    let mut just_subjects: Vec<Subject<T>> = subjects.iter_mut().map(|s| std::mem::replace(&mut s.3, Subject::placeholder())).collect();
-    measure(&mut just_subjects, rounds, block_ms);
-
-    for ((_, len, shape, _), subject) in subjects.iter().zip(just_subjects.iter()) {
-        match shape {
-            Some(key) => {
-                model.radix4.insert(*key, subject.best());
-            }
-            None => {
-                model.butterfly.insert(*len, subject.best());
-            }
-        }
-    }
-    model
-}
-
-/// Fit one overhead-per-element number for each composing algorithm.
-///
-/// Kinds are fitted in dependency order, since the residual of a MixedRadix that contains a
-/// MixedRadixSmall only means anything once the Small's own overhead is known.
-fn fit_overheads<T: FftNum>(
-    model: &mut Model,
-    lengths: &[usize],
-    rounds: usize,
-    block_ms: f64,
-    cap: usize,
-) -> Vec<(std::sync::Arc<Recipe>, f64)> {
-    let mut samples: Vec<(std::sync::Arc<Recipe>, f64)> = Vec::new();
-    for &len in lengths {
-        let mut tuner = NeonTuner::<T>::new();
-        let candidates = tuner.candidates_capped(len, cap);
-        let mut subjects: Vec<Subject<T>> = candidates
-            .iter()
-            .map(|recipe| {
-                let fft = tuner.build(recipe, FftDirection::Forward);
-                Subject::new(to_spec(recipe), fft, 1)
-            })
-            .collect();
-        measure(&mut subjects, rounds, block_ms);
-        for (recipe, subject) in candidates.iter().zip(subjects.iter()) {
-            samples.push((std::sync::Arc::clone(recipe), subject.best()));
-        }
-    }
-
-    let mut fitted: Vec<&'static str> = Vec::new();
-    for target in ["mrs", "gts", "mr", "gt", "rad", "bs"] {
-        let usable: Vec<(u32, f64)> = samples
-            .iter()
-            .filter(|(recipe, _)| kind(recipe) == target && model.descendants_known(recipe, &fitted))
-            .filter_map(|(recipe, measured)| {
-                model
-                    .inner_cost(recipe)
-                    .map(|inner| (bucket_of(recipe), (measured - inner) / overhead_scale(recipe)))
-            })
-            .collect();
-        if usable.is_empty() {
-            eprintln!("warning: no calibration samples for '{}'", target);
-            continue;
-        }
-
-        // One median per log2 bucket, but only for buckets with enough samples to mean
-        // anything. Sparse buckets are dropped and filled in by interpolation instead.
-        let mut by_bucket: std::collections::BTreeMap<u32, Vec<f64>> = Default::default();
-        for (bucket, residual) in usable.iter() {
-            by_bucket.entry(*bucket).or_default().push(*residual);
-        }
-        const MIN_PER_BUCKET: usize = 3;
-        let mut table: Vec<(u32, f64)> = by_bucket
-            .iter()
-            .filter(|(_, values)| values.len() >= MIN_PER_BUCKET)
-            .map(|(bucket, values)| (*bucket, median_of(values.clone())))
-            .collect();
-
-        // Too little data to describe a curve, so fall back to one constant for this kind.
-        if table.len() < 2 {
-            table = vec![(0, median_of(usable.iter().map(|(_, r)| *r).collect()))];
-        }
-
-        let rendered: Vec<String> = table
-            .iter()
-            .map(|(bucket, value)| format!("{}:{:.2}", 1usize << bucket, value))
-            .collect();
-        println!(
-            "  {:<5} {:>3} buckets from {:>4} samples   {}",
-            target,
-            table.len(),
-            usable.len(),
-            rendered.join(" ")
-        );
-        model.overhead.insert(target, table);
-        fitted.push(target);
-    }
-    samples
-}
-
-
 /// Check that every enumerated candidate actually computes a correct FFT.
 ///
-/// Timing a recipe says nothing about whether it is valid, and an invalid one (a GoodThomas on
-/// non-coprime sides, say) would happily produce fast wrong answers. Each candidate is compared
-/// against a direct DFT of the same input.
-fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], cap: usize) {
+/// Timing a recipe says nothing about whether it is valid, and an invalid one would happily
+/// produce fast wrong answers. Each candidate is compared against a direct DFT.
+fn cmd_verify<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
     let mut worst_overall: f64 = 0.0;
     let mut failures = 0usize;
 
@@ -421,8 +431,7 @@ fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], c
         // Reference: a direct DFT, which shares no code with the recipes under test.
         let reference_fft = rustfft::algorithm::Dft::<T>::new(len, FftDirection::Forward);
         let mut reference = input.clone();
-        let mut reference_scratch =
-            vec![Complex::zero(); reference_fft.get_inplace_scratch_len()];
+        let mut reference_scratch = vec![Complex::zero(); reference_fft.get_inplace_scratch_len()];
         reference_fft.process_with_scratch(&mut reference, &mut reference_scratch);
         let reference_norm: f64 = reference
             .iter()
@@ -430,13 +439,13 @@ fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], c
             .sum::<f64>()
             .sqrt();
 
-        let mut tuner = NeonTuner::<T>::new();
-        let candidates = tuner.candidates_capped(len, cap);
+        let mut planner = P::new();
+        let specs = candidates_capped(&mut planner, len, opts.cap);
         let mut worst_here: f64 = 0.0;
         let mut worst_spec = String::new();
 
-        for recipe in candidates.iter() {
-            let fft = tuner.build(recipe, FftDirection::Forward);
+        for spec in specs.iter() {
+            let fft = planner.build(spec, FftDirection::Forward);
             let mut buffer = input.clone();
             let mut scratch = vec![Complex::zero(); fft.get_inplace_scratch_len()];
             fft.process_with_scratch(&mut buffer, &mut scratch);
@@ -450,7 +459,7 @@ fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], c
                 / reference_norm;
             if error > worst_here {
                 worst_here = error;
-                worst_spec = to_spec(recipe);
+                worst_spec = to_spec_string(spec);
             }
         }
 
@@ -461,7 +470,7 @@ fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], c
         println!(
             "{:>8}  {} candidates, worst relative error {:.3e}  {}{}",
             len,
-            candidates.len(),
+            specs.len(),
             worst_here,
             if bad { "FAIL " } else { "" },
             worst_spec
@@ -478,36 +487,44 @@ fn cmd_verify<T: FftNum + rustfft::num_traits::ToPrimitive>(lengths: &[usize], c
     }
 }
 
-
 /// Show how each algorithm's per-element overhead varies with size.
-///
-/// The model charges one constant per element per algorithm. That is only right if the constant
-/// really is constant. GoodThomas and Rader's both reindex with a scatter rather than a
-/// transpose, so their per-element cost has every reason to grow once the working set stops
-/// fitting in cache, and if it does, a single number cannot express it.
-fn cmd_residuals<T: FftNum>(lengths: &[usize], rounds: usize, block_ms: f64, cap: usize) {
+fn cmd_residuals<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
     let max_len = lengths.iter().copied().max().unwrap_or(1024) * 4;
     eprintln!("measuring primitives...");
-    let mut model = calibrate_primitives::<T>(rounds, block_ms, max_len);
+    let mut model = calibrate_primitives::<T, P>(opts.rounds, opts.block_ms, max_len);
     eprintln!("fitting overheads...");
-    let samples = fit_overheads::<T>(&mut model, lengths, rounds, block_ms, cap);
+    let samples = fit_overheads::<T, P>(
+        &mut model,
+        lengths,
+        opts.rounds,
+        opts.block_ms,
+        opts.cap,
+        opts.bucketed,
+    );
 
-    // kind -> log2 bucket -> residuals
-    let mut binned: std::collections::BTreeMap<&'static str, std::collections::BTreeMap<u32, Vec<f64>>> =
-        Default::default();
-    for (recipe, measured) in samples.iter() {
-        let k = kind(recipe);
-        if !matches!(k, "mr" | "mrs" | "gt" | "gts" | "rad" | "bs") {
+    let mut binned: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeMap<u32, Vec<f64>>,
+    > = Default::default();
+    for (spec, measured) in samples.iter() {
+        if !FIT_ORDER.contains(&spec.kind()) {
             continue;
         }
-        if let Some(inner) = model.inner_cost(recipe) {
-            let residual = (measured - inner) / overhead_scale(recipe);
-            let bucket = (recipe.len() as f64).log2() as u32;
-            binned.entry(k).or_default().entry(bucket).or_default().push(residual);
+        if let Some(inner) = model.inner_cost(spec) {
+            let residual = (measured - inner) / overhead_scale(spec);
+            binned
+                .entry(spec.kind())
+                .or_default()
+                .entry(bucket_of(spec))
+                .or_default()
+                .push(residual);
         }
     }
 
-    println!("{:<5} {:>8} {:>8} {:>9} {:>7}", "kind", "len>=", "median", "p25..p75", "n");
+    println!(
+        "{:<5} {:>8} {:>8} {:>9} {:>7}",
+        "kind", "len>=", "median", "p25..p75", "n"
+    );
     for (kind, buckets) in binned {
         for (bucket, values) in buckets {
             if values.len() < 3 {
@@ -529,20 +546,22 @@ fn cmd_residuals<T: FftNum>(lengths: &[usize], rounds: usize, block_ms: f64, cap
     }
 }
 
-fn cmd_model<T: FftNum>(
-    train: &[usize],
-    test: &[usize],
-    rounds: usize,
-    block_ms: f64,
-    cap: usize,
-) {
+fn cmd_model<T: FftNum, P: TunablePlanner<T>>(train: &[usize], test: &[usize], opts: &Options) {
     let max_len = test.iter().chain(train.iter()).copied().max().unwrap_or(1024) * 4;
 
+    println!("planner: {}", P::label());
     println!("measuring primitives...");
-    let mut model = calibrate_primitives::<T>(rounds, block_ms, max_len);
+    let mut model = calibrate_primitives::<T, P>(opts.rounds, opts.block_ms, max_len);
 
     println!("fitting overheads on {} training lengths...", train.len());
-    fit_overheads::<T>(&mut model, train, rounds, block_ms, cap);
+    fit_overheads::<T, P>(
+        &mut model,
+        train,
+        opts.rounds,
+        opts.block_ms,
+        opts.cap,
+        opts.bucketed,
+    );
     println!("\n{}", model.describe());
 
     println!(
@@ -553,19 +572,16 @@ fn cmd_model<T: FftNum>(
     let mut planner_regrets = Vec::new();
 
     for &len in test {
-        let mut tuner = NeonTuner::<T>::new();
-        let candidates = tuner.candidates_capped(len, cap);
-        let mut subjects: Vec<Subject<T>> = candidates
+        let mut planner = P::new();
+        let specs = candidates_capped(&mut planner, len, opts.cap);
+        let mut subjects: Vec<Subject<T>> = specs
             .iter()
-            .map(|recipe| {
-                let fft = tuner.build(recipe, FftDirection::Forward);
-                Subject::new(to_spec(recipe), fft, 1)
+            .map(|spec| {
+                let fft = planner.build(spec, FftDirection::Forward);
+                Subject::new(to_spec_string(spec), fft, 1)
             })
             .collect();
-        measure(&mut subjects, rounds, block_ms);
-
-        let planner_time_pass1 = subjects[0].best();
-        let _ = planner_time_pass1;
+        measure(&mut subjects, opts.rounds, opts.block_ms);
 
         // Fastest of the first pass, used only to pick which recipes deserve a careful re-timing.
         let best_index = subjects
@@ -575,10 +591,10 @@ fn cmd_model<T: FftNum>(
             .map(|(i, _)| i)
             .unwrap();
 
-        let model_index = candidates
+        let model_index = specs
             .iter()
             .enumerate()
-            .filter_map(|(i, recipe)| model.cost(recipe).map(|c| (i, c)))
+            .filter_map(|(i, spec)| model.cost(spec).map(|c| (i, c)))
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .map(|(i, _)| i);
 
@@ -587,11 +603,10 @@ fn cmd_model<T: FftNum>(
             None => "<no candidate priced>".to_string(),
         };
 
-        // Second pass. The winner of a 48-way comparison is biased fast: with sub-percent
-        // noise, the minimum of many draws lands below the true minimum, which puts a floor
-        // under any regret measured against it. Re-timing just the three recipes of interest,
-        // for longer, removes most of that bias and shows whether the model is actually behind
-        // the best or merely behind the luckiest measurement.
+        // Second pass. The winner of a wide comparison is biased fast: with sub-percent noise,
+        // the minimum of many draws lands below the true minimum, which puts a floor under any
+        // regret measured against it. Re-timing just the recipes of interest, for longer,
+        // removes most of that bias.
         let finalists: Vec<usize> = {
             let mut picked = vec![0usize, best_index];
             if let Some(i) = model_index {
@@ -604,15 +619,14 @@ fn cmd_model<T: FftNum>(
         let mut finals: Vec<Subject<T>> = finalists
             .iter()
             .map(|&i| {
-                let fft = tuner.build(&candidates[i], FftDirection::Forward);
-                Subject::new(to_spec(&candidates[i]), fft, 1)
+                let fft = planner.build(&specs[i], FftDirection::Forward);
+                Subject::new(to_spec_string(&specs[i]), fft, 1)
             })
             .collect();
-        measure(&mut finals, rounds * 4, block_ms);
+        measure(&mut finals, opts.rounds * 4, opts.block_ms);
 
-        let time_of = |index: usize| -> f64 {
-            finals[finalists.iter().position(|&i| i == index).unwrap()].best()
-        };
+        let time_of =
+            |index: usize| -> f64 { finals[finalists.iter().position(|&i| i == index).unwrap()].best() };
         let planner_time = time_of(0);
         let best_time = finalists
             .iter()
@@ -633,14 +647,15 @@ fn cmd_model<T: FftNum>(
             len,
             model_regret,
             planner_regret,
-            if model_regret <= 1.001 { "= best".to_string() } else { model_spec }
+            if model_regret <= 1.001 {
+                "= best".to_string()
+            } else {
+                model_spec
+            }
         );
     }
 
-    for (label, mut values) in [
-        ("model  ", model_regrets),
-        ("planner", planner_regrets),
-    ] {
+    for (label, mut values) in [("model  ", model_regrets), ("planner", planner_regrets)] {
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = values.len();
         let mean = values.iter().sum::<f64>() / n as f64;
@@ -655,123 +670,156 @@ fn cmd_model<T: FftNum>(
     }
 }
 
+fn cmd_emit<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options, element: &str) {
+    let max_len = lengths.iter().copied().max().unwrap_or(1024) * 4;
+    eprintln!("measuring primitives...");
+    let mut model = calibrate_primitives::<T, P>(opts.rounds, opts.block_ms, max_len);
+    eprintln!("fitting overheads on {} lengths...", lengths.len());
+    fit_overheads::<T, P>(
+        &mut model,
+        lengths,
+        opts.rounds,
+        opts.block_ms,
+        opts.cap,
+        opts.bucketed,
+    );
+    print!("{}", emit::emit(&model, element, P::label()));
+}
+
 // ---------------------------------------------------------------------------
+
+enum Command {
+    Time(Vec<String>),
+    Regret(Vec<usize>),
+    Model(Vec<usize>, Vec<usize>),
+    Residuals(Vec<usize>),
+    Verify(Vec<usize>),
+    Emit(Vec<usize>),
+}
+
+fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
+    command: &Command,
+    opts: &Options,
+    element: &str,
+) {
+    match command {
+        Command::Time(specs) => cmd_time::<T, P>(specs, opts),
+        Command::Regret(lengths) => cmd_regret::<T, P>(lengths, opts),
+        Command::Model(train, test) => cmd_model::<T, P>(train, test, opts),
+        Command::Residuals(lengths) => cmd_residuals::<T, P>(lengths, opts),
+        Command::Verify(lengths) => cmd_verify::<T, P>(lengths, opts),
+        Command::Emit(lengths) => cmd_emit::<T, P>(lengths, opts, element),
+    }
+}
+
+fn dispatch<T: FftNum + ToPrimitive>(planner: &str, command: &Command, opts: &Options, el: &str) {
+    match planner {
+        "scalar" => run::<T, ScalarTuner<T>>(command, opts, el),
+        // The manifest gives rustfft the SIMD feature matching the target, so architecture
+        // alone decides which of these exists. A tool-crate `feature = ...` cfg would refer to
+        // the tool's own features and always be false.
+        #[cfg(target_arch = "aarch64")]
+        "neon" => run::<T, rustfft::tuning::NeonTuner<T>>(command, opts, el),
+        #[cfg(target_arch = "x86_64")]
+        "sse" => run::<T, rustfft::tuning::SseTuner<T>>(command, opts, el),
+        other => {
+            eprintln!(
+                "unknown or unavailable planner '{}' on this build; try 'scalar'",
+                other
+            );
+            std::process::exit(2);
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: planner_tuning <time|regret> [options] ARGS...");
-        eprintln!("  --rounds N     timing rounds per subject (default 9)");
-        eprintln!("  --block-ms MS  wall-clock time per timed block (default 10)");
-        eprintln!("  --f32          measure f32 instead of f64");
-        eprintln!("  --verbose      for 'regret', list the top candidates per length");
-        eprintln!("  --cap N        max candidates per length (default 48)");
-        eprintln!("commands: time SPEC... | regret LEN... | model TRAIN... 0 TEST... | verify LEN... | emit LEN...");
+        eprintln!("usage: planner_tuning <command> [options] ARGS...");
+        eprintln!("commands: time SPEC... | regret LEN... | model TRAIN... 0 TEST...");
+        eprintln!("          residuals LEN... | verify LEN... | emit LEN...");
+        eprintln!("  --planner NAME  scalar (default), neon, sse");
+        eprintln!("  --rounds N      timing rounds per subject (default 9)");
+        eprintln!("  --block-ms MS   wall-clock time per timed block (default 10)");
+        eprintln!("  --cap N         max candidates per length (default 48)");
+        eprintln!("  --f32           measure f32 instead of f64");
+        eprintln!("  --bucketed      fit overhead curves over working set, not constants");
+        eprintln!("  --verbose       for 'regret', list the top candidates per length");
         std::process::exit(2);
     }
 
-    let command = args[0].clone();
-    let mut rounds = 9usize;
-    let mut block_ms = 10.0f64;
+    let command_name = args[0].clone();
+    let mut planner = "scalar".to_string();
+    let mut opts = Options {
+        rounds: 9,
+        block_ms: 10.0,
+        cap: 48,
+        verbose: false,
+        bucketed: false,
+    };
     let mut f32_mode = false;
-    let mut verbose = false;
-    let mut cap = 48usize;
     let mut rest: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--planner" => {
+                i += 1;
+                planner = args[i].clone();
+            }
             "--rounds" => {
                 i += 1;
-                rounds = args[i].parse().expect("--rounds wants a number");
+                opts.rounds = args[i].parse().expect("--rounds wants a number");
             }
             "--block-ms" => {
                 i += 1;
-                block_ms = args[i].parse().expect("--block-ms wants a number");
+                opts.block_ms = args[i].parse().expect("--block-ms wants a number");
             }
             "--cap" => {
                 i += 1;
-                cap = args[i].parse().expect("--cap wants a number");
+                opts.cap = args[i].parse().expect("--cap wants a number");
             }
             "--f32" => f32_mode = true,
-            "--verbose" => verbose = true,
+            "--bucketed" => opts.bucketed = true,
+            "--verbose" => opts.verbose = true,
             other => rest.push(other.to_string()),
         }
         i += 1;
     }
 
-    request_performance_core();
+    let numbers = |values: &[String]| -> Vec<usize> {
+        values
+            .iter()
+            .map(|s| s.parse().expect("lengths must be numbers"))
+            .collect()
+    };
 
-    match command.as_str() {
-        "time" => {
-            if f32_mode {
-                cmd_time::<f32>(&rest, rounds, block_ms)
-            } else {
-                cmd_time::<f64>(&rest, rounds, block_ms)
-            }
-        }
-        "regret" => {
-            let lengths: Vec<usize> = rest
-                .iter()
-                .map(|s| s.parse().expect("lengths must be numbers"))
-                .collect();
-            if f32_mode {
-                cmd_regret::<f32>(&lengths, rounds, block_ms, verbose, cap)
-            } else {
-                cmd_regret::<f64>(&lengths, rounds, block_ms, verbose, cap)
-            }
-        }
-        "residuals" => {
-            let lengths: Vec<usize> = rest
-                .iter()
-                .map(|s| s.parse().expect("lengths must be numbers"))
-                .collect();
-            if f32_mode {
-                cmd_residuals::<f32>(&lengths, rounds, block_ms, cap)
-            } else {
-                cmd_residuals::<f64>(&lengths, rounds, block_ms, cap)
-            }
-        }
-        "emit" => {
-            let lengths: Vec<usize> = rest
-                .iter()
-                .map(|s| s.parse().expect("lengths must be numbers"))
-                .collect();
-            let max_len = lengths.iter().copied().max().unwrap_or(1024) * 4;
-            eprintln!("measuring primitives...");
-            let mut model = calibrate_primitives::<f64>(rounds, block_ms, max_len);
-            eprintln!("fitting overheads on {} lengths...", lengths.len());
-            fit_overheads::<f64>(&mut model, &lengths, rounds, block_ms, cap);
-            print!("{}", emit::emit(&model, "f64"));
-        }
-        "verify" => {
-            let lengths: Vec<usize> = rest
-                .iter()
-                .map(|s| s.parse().expect("lengths must be numbers"))
-                .collect();
-            if f32_mode {
-                cmd_verify::<f32>(&lengths, cap)
-            } else {
-                cmd_verify::<f64>(&lengths, cap)
-            }
-        }
+    let command = match command_name.as_str() {
+        "time" => Command::Time(rest.clone()),
+        "regret" => Command::Regret(numbers(&rest)),
+        "residuals" => Command::Residuals(numbers(&rest)),
+        "verify" => Command::Verify(numbers(&rest)),
+        "emit" => Command::Emit(numbers(&rest)),
         "model" => {
-            let lengths: Vec<usize> = rest
+            let lengths = numbers(&rest);
+            let split = lengths
                 .iter()
-                .map(|s| s.parse().expect("lengths must be numbers"))
-                .collect();
-            let split = lengths.iter().position(|&l| l == 0).unwrap_or(0);
+                .position(|&l| l == 0)
+                .expect("model wants TRAIN... 0 TEST...");
             let (train, test) = lengths.split_at(split);
-            let test = &test[1..];
-            if f32_mode {
-                cmd_model::<f32>(train, test, rounds, block_ms, cap)
-            } else {
-                cmd_model::<f64>(train, test, rounds, block_ms, cap)
-            }
+            Command::Model(train.to_vec(), test[1..].to_vec())
         }
         other => {
             eprintln!("unknown command '{}'", other);
             std::process::exit(2);
         }
+    };
+
+    request_performance_core();
+
+    if f32_mode {
+        dispatch::<f32>(&planner, &command, &opts, "f32");
+    } else {
+        dispatch::<f64>(&planner, &command, &opts, "f64");
     }
 }
