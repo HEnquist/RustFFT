@@ -46,7 +46,8 @@ pub struct RadersAlgorithm<T> {
     // permutation[k], which is g^(k+1) mod len, less one. The sequence depends only on the
     // primitive root and the length, so building it once here keeps a serial chain of
     // strength-reduced modular multiplies out of the hot loops. avx_raders.rs precomputes its
-    // output mapping for the same reason.
+    // output mapping for the same reason. This costs 4 * (len - 1) bytes, the same order as the
+    // twiddles avx_raders.rs and Bluestein's already store at this size.
     permutation: Box<[u32]>,
 
     len: usize,
