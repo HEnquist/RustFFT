@@ -226,12 +226,12 @@ mod unit_tests {
         test_bodies::composite_base::<WasmVector32, WasmVector64>();
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn test_wasm_simd_radixn_large_recipes() {
         test_bodies::large_recipes::<WasmVector32, WasmVector64>();
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     #[ignore]
     fn test_wasm_simd_radixn_six_layers() {
         test_bodies::six_layers::<WasmVector32, WasmVector64>();
