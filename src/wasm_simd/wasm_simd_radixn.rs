@@ -616,27 +616,46 @@ mod unit_tests {
         }
     }
 
-    /// The recipes the spike was benchmarked on, so the sizes that actually matter stay covered.
-    #[wasm_bindgen_test]
+    /// The recipes the spike was benchmarked on, so the layer shapes that actually matter stay
+    /// covered. The benchmarked lengths used much bigger bases, but the base is just a butterfly
+    /// that the other tests already cover, so the smallest legal one is used here. That keeps the
+    /// naive `Dft` the result is checked against affordable.
+    #[test]
     fn test_wasm_simd_radixn_large_recipes() {
         use RadixFactor::*;
         // (factors, f64 base, f32 base). f32 needs an even base, so it gets its own.
-        let cases: [(&[RadixFactor], usize, usize); 6] = [
-            (&[Factor6, Factor6, Factor6], 5, 6),            // 1080
-            (&[Factor6, Factor5, Factor5], 7, 8),            // 1050
-            (&[Factor6, Factor6, Factor4], 7, 8),            // 1008
-            (&[Factor6, Factor6, Factor3], 12, 12),          // 1296
-            (&[Factor6, Factor6, Factor6, Factor4], 12, 12), // 10368
-            (
-                &[Factor6, Factor6, Factor5, Factor5, Factor4, Factor4],
-                7,
-                8,
-            ), // 100800
+        let cases: [(&[RadixFactor], usize, usize); 5] = [
+            (&[Factor6, Factor6, Factor6], 1, 2),          // 216, 432
+            (&[Factor6, Factor5, Factor5], 1, 2),          // 150, 300
+            (&[Factor6, Factor6, Factor4], 1, 2),          // 144, 288
+            (&[Factor6, Factor6, Factor3], 1, 2),          // 108, 216
+            (&[Factor6, Factor6, Factor6, Factor4], 1, 2), // 864, 1728
         ];
+        test_recipes(&cases);
+    }
+
+    /// The deepest benchmarked recipe, six layers. The smallest legal base still leaves 14400
+    /// (f64) and 28800 (f32) points, and the naive `Dft` they are checked against takes minutes
+    /// on a debug build, so this one is kept out of the normal run. Run it with
+    /// `cargo test --release -- --ignored wasm_simd_radixn_six_layers`.
+    #[test]
+    #[ignore]
+    fn test_wasm_simd_radixn_six_layers() {
+        use RadixFactor::*;
+        let cases: [(&[RadixFactor], usize, usize); 1] = [(
+            &[Factor6, Factor6, Factor5, Factor5, Factor4, Factor4],
+            1,
+            2,
+        )]; // 14400, 28800
+        test_recipes(&cases);
+    }
+
+    /// Runs each (factors, f64 base, f32 base) case in both directions.
+    fn test_recipes(cases: &[(&[RadixFactor], usize, usize)]) {
         for (factors, base64, base32) in cases {
             for direction in [FftDirection::Forward, FftDirection::Inverse] {
-                test_radixn::<f64>(factors, construct_base(base64, direction));
-                test_radixn::<f32>(factors, construct_base(base32, direction));
+                test_radixn::<f64>(factors, construct_base(*base64, direction));
+                test_radixn::<f32>(factors, construct_base(*base32, direction));
             }
         }
     }
