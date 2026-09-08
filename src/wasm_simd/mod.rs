@@ -13,7 +13,6 @@ mod wasm_simd_utils;
 
 pub mod wasm_simd_planner;
 
-use crate::simd_radixn::RadixNVector;
 use crate::FftNum;
 use core::arch::wasm32::v128;
 
@@ -25,7 +24,7 @@ use self::wasm_simd_vector::WasmVector32;
 use self::wasm_simd_vector::WasmVector64;
 
 pub trait WasmNum: FftNum {
-    type VectorType: WasmVector<ScalarType = Self> + RadixNVector<ScalarType = Self>;
+    type VectorType: WasmVector<ScalarType = Self>;
     fn wrap(input: v128) -> Self::VectorType;
 }
 
