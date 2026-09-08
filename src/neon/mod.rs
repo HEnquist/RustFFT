@@ -7,6 +7,7 @@ mod neon_vector;
 pub mod neon_butterflies;
 pub mod neon_prime_butterflies;
 pub mod neon_radix4;
+pub mod neon_radixn;
 
 mod neon_utils;
 
@@ -15,10 +16,11 @@ pub mod neon_planner;
 use std::arch::aarch64::{float32x4_t, float64x2_t};
 
 use crate::FftNum;
+use neon_radixn::RadixNButterflies;
 use neon_vector::NeonVector;
 
 pub trait NeonNum: FftNum {
-    type VectorType: NeonVector<ScalarType = Self>;
+    type VectorType: NeonVector<ScalarType = Self> + RadixNButterflies;
 }
 
 impl NeonNum for f32 {
