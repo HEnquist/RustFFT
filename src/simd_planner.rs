@@ -1,10 +1,10 @@
 //! The FFT design decisions that every SIMD planner makes the same way.
 //!
-//! `NeonPlanner`, `SsePlanner` and `WasmSimdPlanner` each own a private `Recipe` enum and a
-//! private cache, so they can't share the planner itself. What they can share is the arithmetic
-//! that picks a plan, which is a pure function of the length's prime factors and of how many
-//! complex numbers fit in one of the backend's vectors. These functions do that part and hand
-//! back plain numbers; the caller turns them into its own recipes.
+//! `FftPlannerNeon`, `FftPlannerSse` and `FftPlannerWasmSimd` each own a private `Recipe` enum
+//! and a private cache, so they can't share the planner itself. What they can share is the
+//! arithmetic that picks a plan, which is a pure function of the length's prime factors and of
+//! how many complex numbers fit in one of the backend's vectors. These functions do that part
+//! and hand back plain numbers; the caller turns them into its own recipes.
 //!
 //! The scalar planner in `src/plan.rs` deliberately stays out of this. Sharing the choice logic
 //! would tie the SIMD backends to the scalar planner's algorithm set, and the two have never been
@@ -42,6 +42,16 @@ pub enum RadixNPlan {
         factors: Box<[RadixFactor]>,
         base_len: usize,
     },
+}
+
+impl RadixNPlan {
+    /// The base FFT length, which both variants carry, so the caller can build it once.
+    pub fn base_len(&self) -> usize {
+        match self {
+            RadixNPlan::Radix4 { base_len, .. } => *base_len,
+            RadixNPlan::RadixN { base_len, .. } => *base_len,
+        }
+    }
 }
 
 /// Can we do this as a mixed radix with just two butterflies?

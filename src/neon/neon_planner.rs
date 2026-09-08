@@ -516,15 +516,10 @@ impl<T: FftNum> FftPlannerNeon<T> {
     fn design_radixn(&mut self, factors: &PrimeFactors) -> Option<Arc<Recipe>> {
         let plan = simd_planner::design_radixn(factors, simd_planner::complex_per_vector::<T>())?;
 
+        let base_fft = self.design_fft_for_len(plan.base_len());
         Some(match plan {
-            RadixNPlan::Radix4 { k, base_len } => {
-                let base_fft = self.design_fft_for_len(base_len);
-                Arc::new(Recipe::Radix4 { k, base_fft })
-            }
-            RadixNPlan::RadixN { factors, base_len } => {
-                let base_fft = self.design_fft_for_len(base_len);
-                Arc::new(Recipe::RadixN { factors, base_fft })
-            }
+            RadixNPlan::Radix4 { k, .. } => Arc::new(Recipe::Radix4 { k, base_fft }),
+            RadixNPlan::RadixN { factors, .. } => Arc::new(Recipe::RadixN { factors, base_fft }),
         })
     }
 

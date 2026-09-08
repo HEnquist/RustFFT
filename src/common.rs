@@ -287,7 +287,6 @@ impl RadixFactor {
     ///
     /// Every planner picks its base by its own rules, but once the base is divided out the rest
     /// is the same arithmetic for all of them, so this is deliberately free of any policy.
-    #[allow(unused)]
     pub fn split_cross_len(mut cross_len: usize) -> Option<Box<[RadixFactor]>> {
         let mut factors = Vec::new();
         while cross_len % 7 == 0 {
