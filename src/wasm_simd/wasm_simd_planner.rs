@@ -690,7 +690,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_trivial() {
+    fn test_plan_wasm_simd_trivial() {
         // Length 0 and 1 should use Dft
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
         for len in 0..1 {
@@ -701,7 +701,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_largepoweroftwo() {
+    fn test_plan_wasm_simd_largepoweroftwo() {
         // Powers of 2 above 6 should use Radix4
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
         for pow in 6..32 {
@@ -713,7 +713,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_butterflies() {
+    fn test_plan_wasm_simd_butterflies() {
         // Check that all butterflies are used
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
         assert_eq!(*planner.design_fft_for_len(2), Recipe::Butterfly2);
@@ -738,7 +738,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_mixedradix() {
+    fn test_plan_wasm_simd_mixedradix() {
         // Products of several primes that are all too big for a RadixN cross-FFT layer should
         // become MixedRadix
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
@@ -788,7 +788,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_mixedradixsmall() {
+    fn test_plan_wasm_simd_mixedradixsmall() {
         // Products of two "small" lengths < 31 that have a common divisor >1, and isn't a power of 2 should be MixedRadixSmall
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
         for len in [5 * 20, 6 * 9, 12 * 15, 10 * 15].iter() {
@@ -803,7 +803,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_goodthomasbutterfly() {
+    fn test_plan_wasm_simd_goodthomasbutterfly() {
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
         for len in [3 * 7, 5 * 7, 11 * 13, 2 * 29].iter() {
             let plan = planner.design_fft_for_len(*len);
@@ -840,7 +840,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_sse_fft_cache() {
+    fn test_wasm_simd_fft_cache() {
         {
             // Check that FFTs are reused if they're both forward
             let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
@@ -868,7 +868,7 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_sse_recipe_cache() {
+    fn test_wasm_simd_recipe_cache() {
         // Check that all butterflies are used
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
         let fft_a = planner.design_fft_for_len(1234);
