@@ -144,88 +144,61 @@ macro_rules! boilerplate_fft_neon_oop {
     };
 }
 
-// Like `boilerplate_fft_neon_oop`, but for algorithms whose base FFT may itself need scratch, so
-// the scratch lengths come from the struct instead of being hardcoded to zero.
-macro_rules! boilerplate_fft_neon_oop_scratch {
-    ($struct_name:ident, $len_fn:expr) => {
-        impl<N: NeonNum, T: FftNum> Fft<T> for $struct_name<N, T> {
-            fn process_immutable_with_scratch(
-                &self,
-                input: &[Complex<T>],
-                output: &mut [Complex<T>],
-                scratch: &mut [Complex<T>],
-            ) {
-                unsafe {
-                    super::neon_common::neon_fft_helper_immut(
-                        input,
-                        output,
-                        scratch,
-                        self.len(),
-                        self.get_immutable_scratch_len(),
-                        |in_chunk, out_chunk, scratch| {
-                            self.perform_fft_immut(in_chunk, out_chunk, scratch)
-                        },
-                    );
-                }
-            }
-            fn process_outofplace_with_scratch(
-                &self,
-                input: &mut [Complex<T>],
-                output: &mut [Complex<T>],
-                scratch: &mut [Complex<T>],
-            ) {
-                unsafe {
-                    super::neon_common::neon_fft_helper_outofplace(
-                        input,
-                        output,
-                        scratch,
-                        self.len(),
-                        self.get_outofplace_scratch_len(),
-                        |in_chunk, out_chunk, scratch| {
-                            self.perform_fft_out_of_place(in_chunk, out_chunk, scratch)
-                        },
-                    );
-                }
-            }
-            fn process_with_scratch(&self, buffer: &mut [Complex<T>], scratch: &mut [Complex<T>]) {
-                unsafe {
-                    super::neon_common::neon_fft_helper_inplace(
-                        buffer,
-                        scratch,
-                        self.len(),
-                        self.get_inplace_scratch_len(),
-                        |chunk, scratch| {
-                            let (self_scratch, inner_scratch) = scratch.split_at_mut(self.len());
-                            self.perform_fft_out_of_place(chunk, self_scratch, inner_scratch);
-                            chunk.copy_from_slice(self_scratch);
-                        },
-                    )
-                }
-            }
-            #[inline(always)]
-            fn get_inplace_scratch_len(&self) -> usize {
-                self.inplace_scratch_len
-            }
-            #[inline(always)]
-            fn get_outofplace_scratch_len(&self) -> usize {
-                self.outofplace_scratch_len
-            }
-            #[inline(always)]
-            fn get_immutable_scratch_len(&self) -> usize {
-                self.immut_scratch_len
-            }
+// The `RadixNVector::fft_helper_*` methods, which are the same forwarding calls for every NEON
+// vector type: they hand the chunk loop to the target-feature-enabled wrappers below.
+macro_rules! neon_radixn_fft_helpers {
+    () => {
+        #[inline(always)]
+        unsafe fn fft_helper_immut<E>(
+            input: &[E],
+            output: &mut [E],
+            scratch: &mut [E],
+            chunk_size: usize,
+            required_scratch: usize,
+            chunk_fn: impl FnMut(&[E], &mut [E], &mut [E]),
+        ) {
+            super::neon_common::neon_fft_helper_immut(
+                input,
+                output,
+                scratch,
+                chunk_size,
+                required_scratch,
+                chunk_fn,
+            )
         }
-        impl<N: NeonNum, T> Length for $struct_name<N, T> {
-            #[inline(always)]
-            fn len(&self) -> usize {
-                $len_fn(self)
-            }
+        #[inline(always)]
+        unsafe fn fft_helper_outofplace<E>(
+            input: &mut [E],
+            output: &mut [E],
+            scratch: &mut [E],
+            chunk_size: usize,
+            required_scratch: usize,
+            chunk_fn: impl FnMut(&mut [E], &mut [E], &mut [E]),
+        ) {
+            super::neon_common::neon_fft_helper_outofplace(
+                input,
+                output,
+                scratch,
+                chunk_size,
+                required_scratch,
+                chunk_fn,
+            )
         }
-        impl<N: NeonNum, T> Direction for $struct_name<N, T> {
-            #[inline(always)]
-            fn fft_direction(&self) -> FftDirection {
-                self.direction
-            }
+        #[inline(always)]
+        unsafe fn fft_helper_inplace<E>(
+            buffer: &mut [E],
+            scratch: &mut [E],
+            chunk_size: usize,
+            required_scratch: usize,
+            chunk_fn: impl FnMut(&mut [E], &mut [E]),
+        ) {
+            super::neon_common::neon_fft_helper_inplace(
+                buffer,
+                scratch,
+                chunk_size,
+                required_scratch,
+                chunk_fn,
+            )
         }
     };
 }
