@@ -88,18 +88,10 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
     }
 
     let len = factors.get_product();
-    let p2 = factors.get_power_of_two();
-    let p3 = factors.get_power_of_three();
-    let p5 = factors
-        .get_other_factors()
-        .iter()
-        .find_map(|f| if f.value == 5 { Some(f.count) } else { None })
-        .unwrap_or(0);
-    let p7 = factors
-        .get_other_factors()
-        .iter()
-        .find_map(|f| if f.value == 7 { Some(f.count) } else { None })
-        .unwrap_or(0);
+    let p2 = factors.get_power_of(2);
+    let p3 = factors.get_power_of(3);
+    let p5 = factors.get_power_of(5);
+    let p7 = factors.get_power_of(7);
 
     let mut base_len: usize = if factors.has_factors_gt(MAX_RADIXN_FACTOR) {
         // Factors larger than a cross-FFT layer can handle *must* go in the base
@@ -151,7 +143,7 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
         return None;
     }
 
-    let mut cross_len = len / base_len;
+    let cross_len = len / base_len;
 
     // Radix4 is faster than the generic driver on pure powers of four, so hand those over. It
     // needs twice the column count RadixN does, hence the extra check on the base.
@@ -166,39 +158,10 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
         });
     }
 
-    // Split what's left into cross-FFT layers. We can't reuse p2/p3/p5/p7 from above, because
-    // our choice of base knocked them out of sync.
-    let mut radix_factors = Vec::new();
-    while cross_len % 7 == 0 {
-        cross_len /= 7;
-        radix_factors.push(RadixFactor::Factor7);
-    }
-    while cross_len % 6 == 0 {
-        cross_len /= 6;
-        radix_factors.push(RadixFactor::Factor6);
-    }
-    while cross_len % 5 == 0 {
-        cross_len /= 5;
-        radix_factors.push(RadixFactor::Factor5);
-    }
-    while cross_len % 3 == 0 {
-        cross_len /= 3;
-        radix_factors.push(RadixFactor::Factor3);
-    }
-    if !cross_len.is_power_of_two() {
-        return None;
-    }
-
-    // benchmarking suggests that we want to add the 4s *last*, i suspect because 4 is a
-    // better-than-usual value for the transpose
-    let cross_bits = cross_len.trailing_zeros();
-    if cross_bits % 2 == 1 {
-        radix_factors.push(RadixFactor::Factor2);
-    }
-    radix_factors.extend(std::iter::repeat(RadixFactor::Factor4).take(cross_bits as usize / 2));
-
+    // Split what's left into cross-FFT layers. Returns None if the base left behind a factor no
+    // layer can handle, in which case RadixN can't do this length.
     Some(RadixNPlan::RadixN {
-        factors: radix_factors.into_boxed_slice(),
+        factors: RadixFactor::split_cross_len(cross_len)?,
         base_len,
     })
 }
