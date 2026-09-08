@@ -32,6 +32,25 @@ pub fn complex_per_vector<T: FftNum>() -> usize {
     }
 }
 
+/// Don't use Rader's if the inner FFT length has a prime factor larger than this.
+///
+/// 31 is the largest prime butterfly, so at or below it `len - 1` factors entirely into
+/// butterflies and Rader's needs no recursive prime algorithm inside it. Above that the inner FFT
+/// has to nest another Rader's or Bluestein's, and the cost jumps.
+///
+/// Where the cutoff pays off depends on how fast the Bluestein's alternative is, which is why it
+/// depends on the vector width. With two complex numbers per vector the butterflies are twice as
+/// productive, and Bluestein's wins back more than Rader's gains: over primes whose plan the
+/// choice changes, admitting 29 and 31 measured 0.82x for f32 and 1.35x for f64. So f32 keeps the
+/// long-standing 23 and only f64 goes up to 31.
+pub fn max_rader_prime_factor(complex_per_vector: usize) -> usize {
+    if complex_per_vector < 2 {
+        31
+    } else {
+        23
+    }
+}
+
 /// What `design_radixn` decided, in terms the caller turns into its own recipe.
 pub enum RadixNPlan {
     Radix4 {

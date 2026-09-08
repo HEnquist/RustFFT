@@ -13,12 +13,6 @@ use std::{any::TypeId, collections::HashMap, sync::Arc};
 
 const MIN_RADIX4_BITS: u32 = 6; // smallest size to consider radix 4 an option is 2^6 = 64
 
-// Don't use Raders if the inner fft length has a prime factor larger than this. 31 is the largest
-// prime butterfly, so at or below it `len - 1` factors entirely into butterflies and Rader's needs
-// no recursive prime algorithm inside it. Above it the inner FFT has to nest another Rader's or
-// Bluestein's, and the cost jumps.
-const MAX_RADER_PRIME_FACTOR: usize = 31;
-
 /// A Recipe is a structure that describes the design of a FFT, without actually creating it.
 /// It is used as a middle step in the planning process.
 #[derive(Debug, PartialEq, Clone)]
@@ -556,11 +550,13 @@ impl<T: FftNum> FftPlannerWasmSimd<T> {
     fn design_prime(&mut self, len: usize) -> Arc<Recipe> {
         let inner_fft_len_rader = len - 1;
         let raders_factors = PrimeFactors::compute(inner_fft_len_rader);
+        let max_rader =
+            simd_planner::max_rader_prime_factor(simd_planner::complex_per_vector::<T>());
         // If any of the prime factors is too large, Rader's gets slow and Bluestein's is the better choice
         if raders_factors
             .get_other_factors()
             .iter()
-            .any(|val| val.value > MAX_RADER_PRIME_FACTOR)
+            .any(|val| val.value > max_rader)
         {
             // we want to use bluestein's algorithm. we have a free choice of which inner FFT length to use
             // the only restriction is that it has to be (2 * len - 1) or larger. So we want the fastest FFT we can compute at or above that size.
