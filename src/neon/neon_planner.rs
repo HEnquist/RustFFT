@@ -775,8 +775,9 @@ mod unit_tests {
 
     #[test]
     fn test_plan_neon_radixn() {
-        // Products of several small primes should become RadixN
-        let mut planner = FftPlannerNeon::<f64>::new().unwrap();
+        // Products of several small primes should become RadixN. Only f32 uses RadixN, see
+        // `design_radixn` in simd_planner.
+        let mut planner = FftPlannerNeon::<f32>::new().unwrap();
         for pow2 in 2..5 {
             for pow3 in 2..5 {
                 for pow5 in 2..5 {
@@ -799,15 +800,32 @@ mod unit_tests {
         // An f32 vector holds two complex numbers, so RadixN needs an even column count and can
         // never take an odd length. Those have to keep falling back to mixed radix.
         let mut planner32 = FftPlannerNeon::<f32>::new().unwrap();
-        let mut planner64 = FftPlannerNeon::<f64>::new().unwrap();
         for len in [1215, 10125, 3125] {
             let plan32 = planner32.design_fft_for_len(len);
             assert!(!is_radixn(&plan32), "Expected no RadixN, got {:?}", plan32);
             assert_eq!(plan32.len(), len, "Recipe reports wrong length");
+        }
+    }
 
-            let plan64 = planner64.design_fft_for_len(len);
-            assert!(is_radixn(&plan64), "Expected RadixN, got {:?}", plan64);
-            assert_eq!(plan64.len(), len, "Recipe reports wrong length");
+    #[test]
+    fn test_plan_neon_radixn_is_f32_only() {
+        // An f64 vector holds a single complex number, so the cross-FFT layers do one column per
+        // butterfly call and RadixN loses to mixed radix. The planner shouldn't pick it at all.
+        let mut planner = FftPlannerNeon::<f64>::new().unwrap();
+        for pow2 in 2..5 {
+            for pow3 in 2..5 {
+                for pow5 in 2..5 {
+                    for pow7 in 2..5 {
+                        let len = 2usize.pow(pow2)
+                            * 3usize.pow(pow3)
+                            * 5usize.pow(pow5)
+                            * 7usize.pow(pow7);
+                        let plan = planner.design_fft_for_len(len);
+                        assert!(!is_radixn(&plan), "Expected no RadixN, got {:?}", plan);
+                        assert_eq!(plan.len(), len, "Recipe reports wrong length");
+                    }
+                }
+            }
         }
     }
 

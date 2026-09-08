@@ -88,9 +88,19 @@ pub fn design_butterfly_product(len: usize, all_butterflies: &[usize]) -> Option
 /// for what's left, and turn the rest into a list of radixes. Mirrors `design_radixn` in
 /// `src/plan.rs`, which the scalar planner uses for the same job.
 ///
-/// Returns None when RadixN can't cover this length, which happens for f32 when no legal base
-/// is available. The caller falls back to mixed radix in that case.
+/// Returns None when RadixN isn't the right answer here: always for a vector that holds a single
+/// complex number, and for f32 when no legal base is available. The caller falls back to mixed
+/// radix in that case.
 pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Option<RadixNPlan> {
+    // A vector holding a single complex number gets no packing win from the cross-FFT layers: a
+    // column butterfly does one column per call, the same as the scalar one, while RadixN still
+    // pays for the flat transpose and the packed twiddle array. Measured over mixed-factor
+    // lengths from 24 to 241920, that loses to the mixed radix fallback for every base the
+    // design below picks, so f64 stays on the old path and only f32 uses RadixN.
+    if complex_per_vector < 2 {
+        return None;
+    }
+
     // With no factors small enough for a cross-FFT layer, the base would have to be the whole
     // length and there would be nothing left for RadixN to do.
     if !factors.has_factors_leq(MAX_RADIXN_FACTOR) {
