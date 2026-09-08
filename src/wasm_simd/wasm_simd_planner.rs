@@ -12,7 +12,6 @@ use std::{any::TypeId, collections::HashMap, sync::Arc};
 
 const MIN_RADIX4_BITS: u32 = 6; // smallest size to consider radix 4 an option is 2^6 = 64
 const MAX_RADIXN_FACTOR: usize = 7; // The largest butterfly factor that the RadixN algorithm can handle
-const MAX_RADER_PRIME_FACTOR: usize = 23; // don't use Raders if the inner fft length has prime factor larger than this
 
 /// A Recipe is a structure that describes the design of a FFT, without actually creating it.
 /// It is used as a middle step in the planning process.
@@ -36,6 +35,9 @@ pub enum Recipe {
         left_fft: Arc<Recipe>,
         right_fft: Arc<Recipe>,
     },
+    // This backend always prefers Bluestein's, see design_prime, but the variant is kept so the
+    // recipe type stays in step with the other planners and can be built if that changes.
+    #[allow(dead_code)]
     RadersAlgorithm {
         inner_fft: Arc<Recipe>,
     },
@@ -698,34 +700,38 @@ impl<T: FftNum> FftPlannerWasmSimd<T> {
     }
 
     fn design_prime(&mut self, len: usize) -> Arc<Recipe> {
-        let inner_fft_len_rader = len - 1;
-        let raders_factors = PrimeFactors::compute(inner_fft_len_rader);
-        // If any of the prime factors is too large, Rader's gets slow and Bluestein's is the better choice
-        if raders_factors
-            .get_other_factors()
-            .iter()
-            .any(|val| val.value > MAX_RADER_PRIME_FACTOR)
-        {
-            // we want to use bluestein's algorithm. we have a free choice of which inner FFT length to use
-            // the only restriction is that it has to be (2 * len - 1) or larger. So we want the fastest FFT we can compute at or above that size.
+        // Bluestein's, always. Unlike the other backends, this one never picks Rader's.
+        //
+        // Rader's runs its inner FFT twice and then pays a scattered permutation pass over the
+        // whole length. Under wasm that pass costs about 25 ns per element against about 8 on
+        // NEON, roughly three times as much, because there is no scatter/gather and the indexed
+        // loads are bounds checked. Bluestein's instead pays for a larger inner FFT, but that
+        // inner FFT is a power of two, or three times one, so Radix4 handles it well.
+        //
+        // Measured over 15 primes from 211 to 114689 whose len - 1 is smooth enough that the
+        // rule the other backends use would choose Rader's: Bluestein's won 14 of them, by up to
+        // 1.92x. The one exception was 65537, where len - 1 is exactly 2^16 and Rader's won by
+        // 1.18x, which is not worth a special case.
+        //
+        // The other backends keep Rader's, where it is the faster choice at nearly every such
+        // length; see design_prime in neon_planner.rs.
 
-            // the most obvious choice is the next-highest power of two, but there's one trick we can pull to get a smaller fft that we can be 100% certain will be faster
-            let min_inner_len = 2 * len - 1;
-            let inner_len_pow2 = min_inner_len.checked_next_power_of_two().unwrap();
-            let inner_len_factor3 = inner_len_pow2 / 4 * 3;
+        // We have a free choice of inner FFT length, the only restriction being that it has to be
+        // (2 * len - 1) or larger. So we want the fastest FFT we can compute at or above that
+        // size. The obvious choice is the next-highest power of two, but there's one trick we can
+        // pull to get a smaller fft that we can be 100% certain will be faster.
+        let min_inner_len = 2 * len - 1;
+        let inner_len_pow2 = min_inner_len.checked_next_power_of_two().unwrap();
+        let inner_len_factor3 = inner_len_pow2 / 4 * 3;
 
-            let inner_len = if inner_len_factor3 >= min_inner_len {
-                inner_len_factor3
-            } else {
-                inner_len_pow2
-            };
-            let inner_fft = self.design_fft_for_len(inner_len);
-
-            Arc::new(Recipe::BluesteinsAlgorithm { len, inner_fft })
+        let inner_len = if inner_len_factor3 >= min_inner_len {
+            inner_len_factor3
         } else {
-            let inner_fft = self.design_fft_with_factors(inner_fft_len_rader, raders_factors);
-            Arc::new(Recipe::RadersAlgorithm { inner_fft })
-        }
+            inner_len_pow2
+        };
+        let inner_fft = self.design_fft_for_len(inner_len);
+
+        Arc::new(Recipe::BluesteinsAlgorithm { len, inner_fft })
     }
 
     fn design_radix4(&mut self, factors: PrimeFactors) -> Arc<Recipe> {
@@ -955,26 +961,24 @@ mod unit_tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_plan_sse_bluestein_vs_rader() {
+    fn test_plan_wasm_simd_always_bluesteins() {
+        // Unlike the other backends, this one uses Bluestein's for every prime, including the
+        // ones with a smooth len - 1 that the others hand to Rader's. See design_prime.
         let difficultprimes: [usize; 11] = [59, 83, 107, 149, 167, 173, 179, 359, 719, 1439, 2879];
-        let easyprimes: [usize; 24] = [
+        let smoothprimes: [usize; 26] = [
             53, 61, 67, 71, 73, 79, 89, 97, 101, 103, 109, 113, 127, 131, 137, 139, 151, 157, 163,
-            181, 191, 193, 197, 199,
+            181, 191, 193, 197, 199, 1009, 65537,
         ];
 
         let mut planner = FftPlannerWasmSimd::<f64>::new().unwrap();
-        for len in difficultprimes.iter() {
+        for len in difficultprimes.iter().chain(smoothprimes.iter()) {
             let plan = planner.design_fft_for_len(*len);
             assert!(
                 is_bluesteins(&plan),
                 "Expected BluesteinsAlgorithm, got {:?}",
                 plan
             );
-            assert_eq!(plan.len(), *len, "Recipe reports wrong length");
-        }
-        for len in easyprimes.iter() {
-            let plan = planner.design_fft_for_len(*len);
-            assert!(is_raders(&plan), "Expected RadersAlgorithm, got {:?}", plan);
+            assert!(!is_raders(&plan), "Rader's should never be chosen here");
             assert_eq!(plan.len(), *len, "Recipe reports wrong length");
         }
     }
