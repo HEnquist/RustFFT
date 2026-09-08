@@ -64,20 +64,40 @@ Buckets 2 and 3 are the "no other factors" case, where the cutoff never applies.
 The split holds across three length bands (under 2k, 2k to 15k, over 15k), so it is not a size
 artifact.
 
-So the cutoff was mistuned in both directions, not just between 23 and 31:
+So f32 was badly mistuned. f64 was already right, for a reason the A/B above does not show:
 
-- f32 wants **7**. Bluestein's inner FFT is a power of two, so it gets the full Radix4 benefit
-  when a vector holds two complex numbers, and pulls ahead as soon as `len - 1` needs a factor
-  above 7.
-- f64 wants **43**. With one complex number per vector that advantage largely goes away, and
-  Rader's keeps winning past the largest prime butterfly, so its inner FFT nesting a prime
-  algorithm of its own is still cheaper than Bluestein's.
+- f32 wants **7**, not 23. Bluestein's inner FFT is a power of two, so it gets the full Radix4
+  benefit when a vector holds two complex numbers, and pulls ahead as soon as `len - 1` needs a
+  factor above 7.
+- f64 stays at **31**, which is the largest prime butterfly. At or below it, `len - 1` factors
+  entirely into butterflies and Rader's needs no recursive prime algorithm inside it.
 
-Applied as `max_rader_prime_factor`, 7 for f32 and 43 for f64. End to end check against b631958
-in progress.
+### The trap in the A/B, worth knowing before trusting it on ARM
 
-The harness is `examples/tune_rader_cutoff.rs` on this branch, also temporary. Run it as
-`taskset -c 4 cargo run --release --example tune_rader_cutoff > out.csv`, roughly 15 minutes.
+The bucket table says f64 Rader's still wins at 37, 41 and 43, so the obvious move was to raise
+the f64 cutoff to 43. End to end through the planner that came out at 0.96x, 0.91x and 0.86x for
+those buckets, the opposite of what the A/B predicted.
+
+The reason is that `alt_raders` builds its inner FFT with `plan_fft_forward(len - 1)`, using
+whatever cutoff is compiled in at the time. Measured with the cutoff at 31, the inner prime factor
+of 37 or 41 or 43 gets Bluestein's, which is fast. Raising the cutoff to 43 changes that too, so
+Rader's starts nesting another Rader's, and the whole thing gets slower. The A/B measured a
+configuration that raising the cutoff destroys.
+
+So the A/B is only trustworthy at or below the largest prime butterfly, 31, where no nesting is
+in play. Above that, only an end to end comparison of two builds counts. The original comment in
+the code about 31 was right all along.
+
+### End to end (ryzen250, SSE), f32 cutoff 23 to 7
+
+Planned FFT, 112 primes, 5 paired rounds, above 1.00x means the new cutoff is faster. Buckets 29
+and up are unchanged, since both the old and new cutoff send them to Bluestein's:
+
+| bucket | 5 | 7 | 11 | 13 | 17 | 19 | 23 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| f32 | 0.99x | 1.03x | 1.43x | 1.27x | 1.35x | 1.06x | 1.22x |
+
+The one soft spot is bucket 19 under 2k, at 0.61x for len 229. Everything over 2k improves.
 
 ## Open questions
 
@@ -100,6 +120,6 @@ has been measured. Two things to confirm:
    should land somewhere similar. If it does not, `max_rader_prime_factor` has to become backend
    aware rather than just width aware.
 
-The bench group constants in `body.rs` still bracket the old 23 and 31 cutoffs. They want
-regrouping around the new ones: at or below 7 both types use Rader's, 11 to 43 is the band where
-f32 and f64 now disagree, and above 47 both use Bluestein's.
+The prime bench groups in `body.rs` are now grouped around the current cutoffs: `prime_rader` is
+at or below 7 where both types use Rader's, `prime_split` is 11 to 31 where f32 uses Bluestein's
+and f64 uses Rader's, and `prime_bluestein` is above every butterfly where both use Bluestein's.

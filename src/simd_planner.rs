@@ -34,20 +34,35 @@ pub fn complex_per_vector<T: FftNum>() -> usize {
 
 /// Don't use Rader's if the inner FFT length has a prime factor larger than this.
 ///
-/// 31 is the largest prime butterfly, so at or below it `len - 1` factors entirely into
-/// butterflies and Rader's needs no recursive prime algorithm inside it. Above that the inner FFT
-/// has to nest another Rader's or Bluestein's, and the cost jumps.
+/// Rader's turns a prime length into an FFT of `len - 1`, and Bluestein's turns it into one of
+/// the next power of two above `2 * len - 1`, or three quarters of that. Which wins depends on
+/// how fast each of those inner lengths is, and that in turn depends on the vector width, so the
+/// cutoff does too.
 ///
-/// Where the cutoff pays off depends on how fast the Bluestein's alternative is, which is why it
-/// depends on the vector width. With two complex numbers per vector the butterflies are twice as
-/// productive, and Bluestein's wins back more than Rader's gains: over primes whose plan the
-/// choice changes, admitting 29 and 31 measured 0.82x for f32 and 1.35x for f64. So f32 keeps the
-/// long-standing 23 and only f64 goes up to 31.
+/// Measured on SSE over primes from 100 to 80000, bucketed by the largest prime factor of
+/// `len - 1`, which is what `design_prime` branches on. Rader's over Bluestein's, so below 1.00x
+/// is Rader's winning:
+///
+/// | largest factor | 5 | 7 | 11 | 17 | 23 | 31 |
+/// | --- | --- | --- | --- | --- | --- | --- |
+/// | f32 | 0.67x | 0.92x | 1.35x | 1.19x | 1.28x | 1.40x |
+/// | f64 | 0.57x | 0.76x | 0.63x | 0.71x | 0.83x | 0.75x |
+///
+/// An f32 vector holds two complex numbers, so Bluestein's power of two inner FFT gets the full
+/// benefit of Radix4 and pulls ahead as soon as `len - 1` needs a factor above 7. An f64 vector
+/// holds one, that advantage largely goes away, and Rader's keeps winning.
+///
+/// 31 is the ceiling for f64 rather than a measurement, and it is the largest prime butterfly.
+/// At or below it, `len - 1` factors entirely into butterflies and Rader's needs no recursive
+/// prime algorithm inside it. Going above measured well in a straight Rader's against
+/// Bluestein's comparison, but that comparison is misleading there: raising the cutoff also
+/// changes how Rader's own inner FFT gets planned, so it starts nesting another Rader's. End to
+/// end over the same primes, a cutoff of 43 came out at 0.86x for the buckets it admits.
 pub fn max_rader_prime_factor(complex_per_vector: usize) -> usize {
     if complex_per_vector < 2 {
         31
     } else {
-        23
+        7
     }
 }
 
@@ -180,6 +195,22 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
 
     if base_len >= len || len % base_len != 0 {
         return None;
+    }
+
+    // TEMPORARY tuning hook, to be removed before this branch merges. Lets
+    // examples/tune_radixn_base.rs force a base length so the choice above can be measured
+    // against the alternatives instead of guessed at.
+    if let Ok(forced) = std::env::var("RUSTFFT_FORCE_RADIXN_BASE") {
+        let forced: usize = forced.parse().unwrap();
+        if forced % complex_per_vector == 0
+            && forced < len
+            && len % forced == 0
+            && RadixFactor::split_cross_len(len / forced).is_some()
+        {
+            base_len = forced;
+        } else {
+            return None;
+        }
     }
 
     let cross_len = len / base_len;

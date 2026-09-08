@@ -122,18 +122,17 @@ macro_rules! planner_choice_benches {
         // a change to the RadixN decision should leave these alone.
         bench_group!(pow2, {4096, 65536}, [planned]);
 
-        // Primes whose `len - 1` factors entirely into butterflies of 23 or less, so every cutoff
-        // from 23 up picks Rader's. A control group for cutoff changes, and the alt says how much
-        // Rader's is winning by.
-        bench_group!(prime_rader, {1453, 2081, 11731}, [planned, alt_bluesteins]);
+        // Primes whose `len - 1` has no prime factor above 7, where both types use Rader's.
+        // The alt says how much Rader's is winning by.
+        bench_group!(prime_rader, {1297, 5881, 22051}, [planned, alt_bluesteins]);
 
-        // Primes whose `len - 1` has a prime factor of 29 or 31. These are exactly the lengths
-        // max_rader_prime_factor decides: admitted they use Rader's, otherwise Bluestein's. Both
-        // alternatives are benched, so the cutoff can be read straight off the numbers.
-        bench_group!(prime_cutoff, {2729, 8867, 33641}, [planned, alt_raders, alt_bluesteins]);
+        // Primes whose `len - 1` has a largest prime factor between 11 and 31. This is the band
+        // where the two types disagree: f32 uses Bluestein's and f64 uses Rader's. Both
+        // alternatives are benched, so each type's choice can be read straight off the numbers.
+        bench_group!(prime_split, {1301, 5501, 22541}, [planned, alt_raders, alt_bluesteins]);
 
-        // Primes whose `len - 1` has a prime factor far above any butterfly, so Rader's has to
-        // nest another prime algorithm inside itself and Bluestein's wins under any cutoff.
-        bench_group!(prime_bluestein, {9931, 43391}, [planned, alt_raders]);
+        // Primes whose `len - 1` has a prime factor above every butterfly, so Rader's would have
+        // to nest another prime algorithm inside itself and both types use Bluestein's.
+        bench_group!(prime_bluestein, {1229, 5503, 22481}, [planned, alt_raders]);
     };
 }
