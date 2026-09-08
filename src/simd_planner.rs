@@ -5,6 +5,12 @@
 //! that picks a plan, which is a pure function of the length's prime factors and of how many
 //! complex numbers fit in one of the backend's vectors. These functions do that part and hand
 //! back plain numbers; the caller turns them into its own recipes.
+//!
+//! The scalar planner in `src/plan.rs` deliberately stays out of this. Sharing the choice logic
+//! would tie the SIMD backends to the scalar planner's algorithm set, and the two have never been
+//! required to match: each backend has its own butterflies, its own Radix4 bases, and its own
+//! answer for primes. Its `design_radixn` already differs in ways that change plans, not just
+//! style, so folding it in would be a planner change to measure, not a deduplication.
 
 use crate::common::RadixFactor;
 use crate::math_utils::PrimeFactors;
