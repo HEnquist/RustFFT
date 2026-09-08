@@ -145,6 +145,92 @@ macro_rules! boilerplate_fft_wasm_simd_oop {
     };
 }
 
+// Like `boilerplate_fft_wasm_simd_oop`, but for algorithms whose base FFT may itself need scratch, so
+// the scratch lengths come from the struct instead of being hardcoded to zero.
+macro_rules! boilerplate_fft_wasm_simd_oop_scratch {
+    ($struct_name:ident, $len_fn:expr) => {
+        impl<S: WasmNum, T: FftNum> Fft<T> for $struct_name<S, T> {
+            fn process_immutable_with_scratch(
+                &self,
+                input: &[Complex<T>],
+                output: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+            ) {
+                unsafe {
+                    super::wasm_simd_common::wasm_simd_fft_helper_immut(
+                        input,
+                        output,
+                        scratch,
+                        self.len(),
+                        self.get_immutable_scratch_len(),
+                        |in_chunk, out_chunk, scratch| {
+                            self.perform_fft_immut(in_chunk, out_chunk, scratch)
+                        },
+                    );
+                }
+            }
+            fn process_outofplace_with_scratch(
+                &self,
+                input: &mut [Complex<T>],
+                output: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+            ) {
+                unsafe {
+                    super::wasm_simd_common::wasm_simd_fft_helper_outofplace(
+                        input,
+                        output,
+                        scratch,
+                        self.len(),
+                        self.get_outofplace_scratch_len(),
+                        |in_chunk, out_chunk, scratch| {
+                            self.perform_fft_out_of_place(in_chunk, out_chunk, scratch)
+                        },
+                    );
+                }
+            }
+            fn process_with_scratch(&self, buffer: &mut [Complex<T>], scratch: &mut [Complex<T>]) {
+                unsafe {
+                    super::wasm_simd_common::wasm_simd_fft_helper_inplace(
+                        buffer,
+                        scratch,
+                        self.len(),
+                        self.get_inplace_scratch_len(),
+                        |chunk, scratch| {
+                            let (self_scratch, inner_scratch) = scratch.split_at_mut(self.len());
+                            self.perform_fft_out_of_place(chunk, self_scratch, inner_scratch);
+                            chunk.copy_from_slice(self_scratch);
+                        },
+                    )
+                }
+            }
+            #[inline(always)]
+            fn get_inplace_scratch_len(&self) -> usize {
+                self.inplace_scratch_len
+            }
+            #[inline(always)]
+            fn get_outofplace_scratch_len(&self) -> usize {
+                self.outofplace_scratch_len
+            }
+            #[inline(always)]
+            fn get_immutable_scratch_len(&self) -> usize {
+                self.immut_scratch_len
+            }
+        }
+        impl<S: WasmNum, T> Length for $struct_name<S, T> {
+            #[inline(always)]
+            fn len(&self) -> usize {
+                $len_fn(self)
+            }
+        }
+        impl<S: WasmNum, T> Direction for $struct_name<S, T> {
+            #[inline(always)]
+            fn fft_direction(&self) -> FftDirection {
+                self.direction
+            }
+        }
+    };
+}
+
 // A wrapper for the FFT helper functions that make sure the entire thing happens with the benefit of the Wasm SIMD target feature,
 // so that things like loading twiddle factor registers etc can be lifted out of the loop
 #[target_feature(enable = "simd128")]
