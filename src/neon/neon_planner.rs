@@ -21,7 +21,12 @@ use crate::math_utils::{PrimeFactor, PrimeFactors};
 use crate::simd_planner::{self, RadixNPlan};
 
 const MIN_RADIX4_BITS: u32 = 6; // smallest size to consider radix 4 an option is 2^6 = 64
-const MAX_RADER_PRIME_FACTOR: usize = 23; // don't use Raders if the inner fft length has prime factor larger than this
+
+// Don't use Raders if the inner fft length has a prime factor larger than this. 31 is the largest
+// prime butterfly, so at or below it `len - 1` factors entirely into butterflies and Rader's needs
+// no recursive prime algorithm inside it. Above it the inner FFT has to nest another Rader's or
+// Bluestein's, and the cost jumps.
+const MAX_RADER_PRIME_FACTOR: usize = 31;
 
 /// A Recipe is a structure that describes the design of a FFT, without actually creating it.
 /// It is used as a middle step in the planning process.
@@ -842,10 +847,10 @@ mod unit_tests {
 
     #[test]
     fn test_plan_neon_bluestein_vs_rader() {
-        let difficultprimes: [usize; 11] = [59, 83, 107, 149, 167, 173, 179, 359, 719, 1439, 2879];
-        let easyprimes: [usize; 24] = [
-            53, 61, 67, 71, 73, 79, 89, 97, 101, 103, 109, 113, 127, 131, 137, 139, 151, 157, 163,
-            181, 191, 193, 197, 199,
+        let difficultprimes: [usize; 10] = [83, 107, 149, 167, 173, 179, 359, 719, 1439, 2879];
+        let easyprimes: [usize; 25] = [
+            53, 59, 61, 67, 71, 73, 79, 89, 97, 101, 103, 109, 113, 127, 131, 137, 139, 151, 157,
+            163, 181, 191, 193, 197, 199,
         ];
 
         let mut planner = FftPlannerNeon::<f64>::new().unwrap();
