@@ -124,7 +124,7 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
     } else if p7 > 0 {
         7
     } else {
-        debug_assert!(p5 > 0);
+        assert!(p5 > 0);
         5
     };
 
@@ -158,10 +158,11 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
         });
     }
 
-    // Split what's left into cross-FFT layers. Returns None if the base left behind a factor no
-    // layer can handle, in which case RadixN can't do this length.
+    // Split what's left into cross-FFT layers. Every factor too big for a layer went into the
+    // base above, so the split can't fail, and the same expect guards it in `src/plan.rs`.
     Some(RadixNPlan::RadixN {
-        factors: RadixFactor::split_cross_len(cross_len)?,
+        factors: RadixFactor::split_cross_len(cross_len)
+            .expect("Every factor RadixN can't handle should have gone into the base"),
         base_len,
     })
 }
