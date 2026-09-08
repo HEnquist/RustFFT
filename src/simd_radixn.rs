@@ -106,7 +106,7 @@ pub trait RadixNVector: Copy + Send + Sync + Sized {
 }
 
 /// The per-layer cross-FFT kernels, holding whatever precomputed state each radix needs.
-enum Layer<V: RadixNVector> {
+enum InternalRadixFactor<V: RadixNVector> {
     Factor2,
     Factor3(V::Butterfly3),
     Factor4(V::Rotation),
@@ -115,15 +115,15 @@ enum Layer<V: RadixNVector> {
     Factor7(V::Butterfly7),
 }
 
-impl<V: RadixNVector> Layer<V> {
+impl<V: RadixNVector> InternalRadixFactor<V> {
     fn radix(&self) -> usize {
         match self {
-            Layer::Factor2 => 2,
-            Layer::Factor3(_) => 3,
-            Layer::Factor4(_) => 4,
-            Layer::Factor5(_) => 5,
-            Layer::Factor6(_) => 6,
-            Layer::Factor7(_) => 7,
+            InternalRadixFactor::Factor2 => 2,
+            InternalRadixFactor::Factor3(_) => 3,
+            InternalRadixFactor::Factor4(_) => 4,
+            InternalRadixFactor::Factor5(_) => 5,
+            InternalRadixFactor::Factor6(_) => 6,
+            InternalRadixFactor::Factor7(_) => 7,
         }
     }
 }
@@ -137,7 +137,7 @@ pub struct SimdRadixN<V: RadixNVector, T> {
     base_len: usize,
 
     factors: Box<[TransposeFactor]>,
-    layers: Box<[Layer<V>]>,
+    butterflies: Box<[InternalRadixFactor<V>]>,
 
     len: usize,
     direction: FftDirection,
@@ -170,7 +170,7 @@ impl<V: RadixNVector, T: FftNum> SimdRadixN<V, T> {
         );
 
         // set up our cross FFT butterfly instances. simultaneously, compute the number of twiddles
-        let mut layers = Vec::with_capacity(factors.len());
+        let mut butterflies = Vec::with_capacity(factors.len());
         let mut cross_fft_len = base_len;
         let mut twiddle_count = 0;
 
@@ -178,14 +178,24 @@ impl<V: RadixNVector, T: FftNum> SimdRadixN<V, T> {
             // twiddles are stored a vector at a time, so a layer needs one chunk per vector column
             twiddle_count += (cross_fft_len / complex_per_vector) * (factor.radix() - 1);
 
-            layers.push(unsafe {
+            butterflies.push(unsafe {
                 match factor {
-                    RadixFactor::Factor2 => Layer::Factor2,
-                    RadixFactor::Factor3 => Layer::Factor3(V::make_butterfly3(direction)),
-                    RadixFactor::Factor4 => Layer::Factor4(V::make_rotate90(direction)),
-                    RadixFactor::Factor5 => Layer::Factor5(V::make_butterfly5(direction)),
-                    RadixFactor::Factor6 => Layer::Factor6(V::make_butterfly6(direction)),
-                    RadixFactor::Factor7 => Layer::Factor7(V::make_butterfly7(direction)),
+                    RadixFactor::Factor2 => InternalRadixFactor::Factor2,
+                    RadixFactor::Factor3 => {
+                        InternalRadixFactor::Factor3(V::make_butterfly3(direction))
+                    }
+                    RadixFactor::Factor4 => {
+                        InternalRadixFactor::Factor4(V::make_rotate90(direction))
+                    }
+                    RadixFactor::Factor5 => {
+                        InternalRadixFactor::Factor5(V::make_butterfly5(direction))
+                    }
+                    RadixFactor::Factor6 => {
+                        InternalRadixFactor::Factor6(V::make_butterfly6(direction))
+                    }
+                    RadixFactor::Factor7 => {
+                        InternalRadixFactor::Factor7(V::make_butterfly7(direction))
+                    }
                 }
             });
 
@@ -256,7 +266,7 @@ impl<V: RadixNVector, T: FftNum> SimdRadixN<V, T> {
             base_len,
 
             factors: transpose_factors.into_boxed_slice(),
-            layers: layers.into_boxed_slice(),
+            butterflies: butterflies.into_boxed_slice(),
 
             len,
             direction,
@@ -307,38 +317,38 @@ impl<V: RadixNVector, T: FftNum> SimdRadixN<V, T> {
         let mut cross_fft_len = self.base_len;
         let mut layer_twiddles: &[V] = &self.twiddles;
 
-        for layer in self.layers.iter() {
+        for factor in self.butterflies.iter() {
             let num_columns = cross_fft_len;
-            cross_fft_len *= layer.radix();
+            cross_fft_len *= factor.radix();
 
             for data in out.chunks_exact_mut(cross_fft_len) {
-                match layer {
-                    Layer::Factor2 => {
+                match factor {
+                    InternalRadixFactor::Factor2 => {
                         cross_layer::<V, 2, _>(data, layer_twiddles, num_columns, |v| {
                             V::column_butterfly2(v)
                         })
                     }
-                    Layer::Factor3(bf) => {
+                    InternalRadixFactor::Factor3(bf) => {
                         cross_layer::<V, 3, _>(data, layer_twiddles, num_columns, |v| {
                             V::column_butterfly3(bf, v)
                         })
                     }
-                    Layer::Factor4(rotation) => {
+                    InternalRadixFactor::Factor4(rotation) => {
                         cross_layer::<V, 4, _>(data, layer_twiddles, num_columns, |v| {
                             V::column_butterfly4(v, *rotation)
                         })
                     }
-                    Layer::Factor5(bf) => {
+                    InternalRadixFactor::Factor5(bf) => {
                         cross_layer::<V, 5, _>(data, layer_twiddles, num_columns, |v| {
                             V::column_butterfly5(bf, v)
                         })
                     }
-                    Layer::Factor6(bf) => {
+                    InternalRadixFactor::Factor6(bf) => {
                         cross_layer::<V, 6, _>(data, layer_twiddles, num_columns, |v| {
                             V::column_butterfly6(bf, v)
                         })
                     }
-                    Layer::Factor7(bf) => {
+                    InternalRadixFactor::Factor7(bf) => {
                         cross_layer::<V, 7, _>(data, layer_twiddles, num_columns, |v| {
                             V::column_butterfly7(bf, v)
                         })
@@ -347,7 +357,7 @@ impl<V: RadixNVector, T: FftNum> SimdRadixN<V, T> {
             }
 
             // skip past all the twiddle factors used in this layer
-            let twiddle_offset = (num_columns / V::COMPLEX_PER_VECTOR) * (layer.radix() - 1);
+            let twiddle_offset = (num_columns / V::COMPLEX_PER_VECTOR) * (factor.radix() - 1);
             layer_twiddles = &layer_twiddles[twiddle_offset..];
         }
     }
