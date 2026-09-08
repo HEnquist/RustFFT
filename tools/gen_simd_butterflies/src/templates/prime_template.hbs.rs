@@ -80,7 +80,7 @@ boilerplate_fft_{{../arch.name_snakecase}}_f32_butterfly!({{this.struct_name_32}
 impl<T: FftNum> {{this.struct_name_32}}<T> {
     /// Safety: The current machine must support the {{../arch.cpu_feature_name}} instruction set
     #[target_feature(enable = "{{../arch.cpu_feature_name}}")]
-    pub(crate) unsafe fn new(direction: FftDirection) -> Self {
+    pub unsafe fn new(direction: FftDirection) -> Self {
         assert_f32::<T>();
         let twiddles = make_twiddles({{this.len}}, direction);
         Self {
@@ -134,7 +134,7 @@ boilerplate_fft_{{../arch.name_snakecase}}_f64_butterfly!({{this.struct_name_64}
 impl<T: FftNum> {{this.struct_name_64}}<T> {
     /// Safety: The current machine must support the {{../arch.cpu_feature_name}} instruction set
     #[target_feature(enable = "{{../arch.cpu_feature_name}}")]
-    pub(crate) unsafe fn new(direction: FftDirection) -> Self {
+    pub unsafe fn new(direction: FftDirection) -> Self {
         assert_f64::<T>();
         let twiddles = make_twiddles({{this.len}}, direction);
         unsafe {Self {
