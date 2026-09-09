@@ -32,6 +32,40 @@ pub fn complex_per_vector<T: FftNum>() -> usize {
     }
 }
 
+/// Don't use Rader's if the inner FFT length has a prime factor larger than this.
+///
+/// Rader's turns a prime length into an FFT of `len - 1`, and Bluestein's turns it into one of
+/// the next power of two above `2 * len - 1`, or three quarters of that. Which wins depends on
+/// how fast each of those inner lengths is, and that in turn depends on the vector width, so the
+/// cutoff does too.
+///
+/// Measured on SSE over primes from 100 to 80000, bucketed by the largest prime factor of
+/// `len - 1`, which is what `design_prime` branches on. Rader's over Bluestein's, so below 1.00x
+/// is Rader's winning:
+///
+/// | largest factor | 5 | 7 | 11 | 17 | 23 | 31 |
+/// | --- | --- | --- | --- | --- | --- | --- |
+/// | f32 | 0.67x | 0.92x | 1.35x | 1.19x | 1.28x | 1.40x |
+/// | f64 | 0.57x | 0.76x | 0.63x | 0.71x | 0.83x | 0.75x |
+///
+/// An f32 vector holds two complex numbers, so Bluestein's power of two inner FFT gets the full
+/// benefit of Radix4 and pulls ahead as soon as `len - 1` needs a factor above 7. An f64 vector
+/// holds one, that advantage largely goes away, and Rader's keeps winning.
+///
+/// 31 is the ceiling for f64 rather than a measurement, and it is the largest prime butterfly.
+/// At or below it, `len - 1` factors entirely into butterflies and Rader's needs no recursive
+/// prime algorithm inside it. Going above measured well in a straight Rader's against
+/// Bluestein's comparison, but that comparison is misleading there: raising the cutoff also
+/// changes how Rader's own inner FFT gets planned, so it starts nesting another Rader's. End to
+/// end over the same primes, a cutoff of 43 came out at 0.86x for the buckets it admits.
+pub fn max_rader_prime_factor(complex_per_vector: usize) -> usize {
+    if complex_per_vector < 2 {
+        31
+    } else {
+        7
+    }
+}
+
 /// What `design_radixn` decided, in terms the caller turns into its own recipe.
 pub enum RadixNPlan {
     Radix4 {
@@ -88,9 +122,19 @@ pub fn design_butterfly_product(len: usize, all_butterflies: &[usize]) -> Option
 /// for what's left, and turn the rest into a list of radixes. Mirrors `design_radixn` in
 /// `src/plan.rs`, which the scalar planner uses for the same job.
 ///
-/// Returns None when RadixN can't cover this length, which happens for f32 when no legal base
-/// is available. The caller falls back to mixed radix in that case.
+/// Returns None when RadixN isn't the right answer here: always for a vector that holds a single
+/// complex number, and for f32 when no legal base is available. The caller falls back to mixed
+/// radix in that case.
 pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Option<RadixNPlan> {
+    // A vector holding a single complex number gets no packing win from the cross-FFT layers: a
+    // column butterfly does one column per call, the same as the scalar one, while RadixN still
+    // pays for the flat transpose and the packed twiddle array. Measured over mixed-factor
+    // lengths from 24 to 241920, that loses to the mixed radix fallback for every base the
+    // design below picks, so f64 stays on the old path and only f32 uses RadixN.
+    if complex_per_vector < 2 {
+        return None;
+    }
+
     // With no factors small enough for a cross-FFT layer, the base would have to be the whole
     // length and there would be nothing left for RadixN to do.
     if !factors.has_factors_leq(MAX_RADIXN_FACTOR) {
@@ -151,6 +195,22 @@ pub fn design_radixn(factors: &PrimeFactors, complex_per_vector: usize) -> Optio
 
     if base_len >= len || len % base_len != 0 {
         return None;
+    }
+
+    // TEMPORARY tuning hook, to be removed before this branch merges. Lets
+    // examples/tune_radixn_base.rs force a base length so the choice above can be measured
+    // against the alternatives instead of guessed at.
+    if let Ok(forced) = std::env::var("RUSTFFT_FORCE_RADIXN_BASE") {
+        let forced: usize = forced.parse().unwrap();
+        if forced % complex_per_vector == 0
+            && forced < len
+            && len % forced == 0
+            && RadixFactor::split_cross_len(len / forced).is_some()
+        {
+            base_len = forced;
+        } else {
+            return None;
+        }
     }
 
     let cross_len = len / base_len;
