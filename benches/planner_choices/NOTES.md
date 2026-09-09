@@ -11,6 +11,10 @@ Everything here is *off* in the PR below us. `simd_radixn_split` matches what `s
 RadixN for both float types, and `MAX_RADER_PRIME_FACTOR` a plain 23 in all three planners. This
 branch is where the width-dependent versions live until they are measured on all three backends.
 
+Design reasoning, the inventory of hand-tuned constants, what FFTW does and why, and the
+recommended order of work all live in `PLANNER-DESIGN.md` next to this file. This file is for
+measurement results.
+
 Open questions, in the order they block things:
 
 1. NEON and wasm f64 RadixN. SSE measured 0.80x over 109 mixed-factor lengths, which is what the
