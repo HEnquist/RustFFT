@@ -46,3 +46,18 @@ rand = "0.8"
 pastey = "0.2"
 getrandom = {version = "^0.2", features = ["js"]}
 wasm-bindgen-test = "^0.3.36"
+
+# The planner choice benchmarks are an exploration tool rather than a regression suite, and there
+# is one per SIMD backend, so they stay out of a plain `cargo bench`. Run one by name:
+#   cargo +nightly bench --bench bench_planner_choices_sse
+[[bench]]
+name = "bench_planner_choices_sse"
+bench = false
+
+[[bench]]
+name = "bench_planner_choices_neon"
+bench = false
+
+[[bench]]
+name = "bench_planner_choices_wasm_simd"
+bench = false
