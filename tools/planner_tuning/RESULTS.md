@@ -215,6 +215,49 @@ generic `cross_layer` against x86-64's 16 xmm registers. That is a testable clai
 any cost model: it predicts the gap shrinks for small radixes and widens for radix 6 and 7, and
 that an AVX build with 16 wider registers would not fix it while a hand-written SSE RadixN would.
 
+## Rader's versus Bluestein's, the decision `MAX_RADER_PRIME_FACTOR` hardcodes
+
+Tested separately on 15 primes chosen to span the rule's own input, `lpf(len-1)` from 5 to 5003,
+at three size decades. This is the decision option D in `PLANNER-DESIGN.md` proposes replacing
+with a cost comparison.
+
+| | right family | mean regret | worst regret |
+|---|---|---|---|
+| counted model, NEON | **14 / 15** | 1.0013 | 1.0139 |
+| counted model, SSE | **15 / 15** | 1.0078 | 1.1176 |
+| planner, NEON | 14 / 15 | 1.0408 | 1.3566 |
+| planner, SSE | 13 / 15 | 1.0310 | 1.2954 |
+
+The model's one miss, NEON at 991, is a 1.4% near-tie and costs 1.014x. That is the right failure
+mode: it goes wrong only where being wrong is nearly free.
+
+### The constant cannot be correct at any value
+
+Three of the primes have `lpf(len-1) = 23` exactly, so the planner's rule sees identical input and
+must give them identical answers. The measurements do not agree with each other:
+
+| len | `lpf(len-1)` | NEON | SSE |
+|---|---|---|---|
+| 1013 | 23 | **Bluestein's** by 1.13x | **Bluestein's** by 1.30x |
+| 9661 | 23 | **Rader's** by 1.39x | **Rader's** by 1.09x |
+| 100189 | 23 | **Rader's** by 1.36x | **Rader's** by 1.36x |
+
+So no threshold on `lpf(len-1)` can be right, at 23 or at any other value, because that quantity
+does not determine the answer: length matters too, and the two disagree by 1.1x to 1.4x in both
+directions. Retuning the constant cannot fix this; only replacing it with a comparison can. The
+counted model gets all three right on both backends.
+
+The other cross-check is 991, where the right answer is **backend-dependent**: Rader's wins by
+1.4% on NEON and loses by 14.5% on SSE. A single shared constant cannot express that either.
+
+### Caveat specific to this test
+
+The enumerator offers exactly **one** Rader's candidate per prime, `rad(planner.plan(len-1))`,
+against six Bluestein's variants, so "best measured" is mildly biased toward Bluestein's and a
+better Rader's inner could flip a close call. It does not look fatal here, since Rader's still wins
+outright at 6 of 15 lengths, but the near-ties (991, 1009 on SSE, 100049 on SSE) should not be
+read as settled. Widening the Rader's side of the enumeration is the obvious follow-up.
+
 ## Caveats
 
 1. **One backend, one float type, one machine.** NEON f64 on an M1. Nothing here shows the weights
