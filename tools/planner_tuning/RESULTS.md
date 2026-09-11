@@ -205,6 +205,11 @@ maintenance burden from the measured model's 22 butterflies and 58 Radix4 shapes
 float type: the table is derived by reading code, and the three numbers are few enough to fit once
 and sanity-check rarely.
 
+**This table is mislabelled, and a later section corrects it.** With only two machines, "per
+backend" cannot be distinguished from "per machine". A wasm run on the M1 shows the memory weights
+follow the machine, not the instruction set; only the counted table and the RadixN register penalty
+are genuinely per-backend. See "What MixedRadix and GoodThomas actually do differently" below.
+
 ### A side finding worth keeping
 
 This independently reproduces, and explains, the open question in `NOTES.md`: SSE measured f64
@@ -327,6 +332,95 @@ Exempting those layers recovers part of the NEON loss but not all of it, and cos
 The change was reverted. The lesson is the same one the Rader's and the SSE cases taught in the
 other direction: **more detail is not automatically more accuracy**, and a term has to be checked
 against the whole set rather than against the decision that motivated it.
+
+## What MixedRadix and GoodThomas actually do differently, and which machine prefers which
+
+With the same factor pair the two inner FFTs are identical, so the whole difference is the glue:
+
+| | MixedRadix (`mixed_radix.rs:128-158`) | GoodThomas (`good_thomas_algorithm.rs`) |
+|---|---|---|
+| passes over the buffer | 4 | 3 |
+| transposes | 3 x tiled `transpose::transpose` | 1 x tiled |
+| permutations | none | 2 x raw scatter, CRT in and Ruritanian out |
+| twiddles | `len` complex multiplies | none |
+
+So `GT - MR = 2*(scatter - tiled transpose) - 1 twiddle pass`. GoodThomas trades away the twiddle
+multiply *and* one whole pass, and pays for it with two scattered passes instead of two tiled ones.
+It wins whenever the scatter penalty is less than about half a complex multiply per element.
+
+That also sets the size of any correction. Centring the model on the truth needs GoodThomas's cost
+multiplied by 1.055 on the M1 and 1.190 on the ThinkCentre, which is about +1.8 and +7.0
+instruction-equivalents per element per scatter, against a complex multiply costing 4 and 6. A small
+term. That is worth remembering against the temptation to rebuild the memory model: the stride-aware
+rewrite above was a large change aimed at a small discrepancy, and it lost more than it gained.
+
+### Two mechanisms proposed and both falsified
+
+**Cache capacity: no.** Both algorithms hold a scratch of `len`, so the footprint is `2*len*16`
+bytes. Lengths 210 to 780 give 6 to 25 KiB, inside the L1 of *both* machines. If capacity drove the
+gap it should vanish there. It is largest there:
+
+| len | footprint | NEON@M1 | SSE@i3 | gap |
+|---|---|---|---|---|
+| 210-780 | 6-25 KiB, inside both L1 | 0.926 | 1.012 | **+0.086** |
+| 1k-4k | 32-128 KiB | 0.950 | 1.006 | +0.056 |
+| 4k-16k | 128-512 KiB | 0.981 | 1.035 | +0.054 |
+| >16k | >512 KiB | 1.002 | 1.076 | +0.074 |
+
+**L1 set conflicts: no.** Conflicts depend on the stride, not the size, so the ratio should worsen
+as the scatter stride gains factors of two. It is flat across the 2-adic content of both `width + 1`
+and `height`, and if anything moves the other way.
+
+What survives is only that it is an execution property of scattered access, visible with everything
+in L1. The mechanism is **not established**.
+
+### The preference follows the machine, not the backend
+
+The obvious confound is that "NEON versus SSE" is also "M1 versus i3-8100T". Running the
+**wasm_simd** backend on the M1 separates them: same memory system, different code generator, and
+no FMA. Over the same 8 lengths and the same 94 factor pairs:
+
+| backend | machine | median gt/mr | GT wins |
+|---|---|---|---|
+| NEON | M1 | 0.9241 | 88 / 94 |
+| **wasm_simd** | **M1** | **0.9280** | **94 / 94** |
+| SSE | i3-8100T | 1.0121 | 39 / 94 |
+
+wasm on the M1 tracks NEON on the M1 to within 0.004 while SSE on the ThinkCentre is 0.088 away.
+**The MixedRadix versus GoodThomas preference is a property of the machine, not of the instruction
+set.**
+
+### Consequence: the weights are not all per-backend
+
+That means this document's earlier "what differs per backend" table is mislabelled. Sorting the
+model's inputs by what they actually depend on:
+
+| input | depends on | how it is obtained | effect if wrong |
+|---|---|---|---|
+| butterfly and primitive op counts | instruction set | read from source | large |
+| generic-RadixN penalty (register file) | instruction set | 16 xmm vs 32 v registers | large: SSE worst 1.152 -> 1.654 |
+| memory weights (seq, strided, permuted) | **the machine** | fitted once per machine | moderate |
+
+Measured directly, by swapping only the memory weights while holding the architectural term:
+
+| | own weights | the other machine's weights | no register term |
+|---|---|---|---|
+| SSE worst | 1.152 | 1.213 | 1.654 |
+| NEON worst | 1.043 | 1.290 | n/a, the term is zero |
+
+So the expensive, architectural part of the model is genuinely portable and read from code, and the
+machine-dependent part is three numbers whose misuse costs 0.06 to 0.25 of worst-case regret. That
+is a far better maintenance story than the measured table, but it is **not** "no measurement at
+all", and with two machines the machine-dependent part cannot be characterised.
+
+### The instrument this needs next is a Pi 5
+
+A Cortex-A76 is NEON with 32 vector registers but a much weaker memory system, so the op counts and
+the register term **must** carry over unchanged and anything that moves is memory-system. It is the
+clean third point, and it tests the specific worry that the M1's unusually strong memory system has
+been flattering the model. As of 2026-09-11 it is still not reachable: `~/.ssh/config` has a bare
+`Host pi5` with no user or key and the name does not resolve. It needs a reachable address, the
+`id_ed25519` public key in its `authorized_keys`, and a Rust toolchain.
 
 ## Caveats
 
