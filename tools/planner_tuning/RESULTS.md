@@ -124,11 +124,10 @@ prices every access the same, degrades worst-case from 1.043 to 1.246. Yet the b
 `strided == permuted == 1.5`, so the model currently does not distinguish a transpose from a
 digit-reversal scatter. One knob, "is this access sequential or not", is carrying all of it.
 
-A clear next refinement, not done here: charge by **actual stride against the cache line**. A
-RadixN cross-layer strides by `num_columns`, which grows with every layer, so the early layers are
-line-friendly and the late ones fetch a whole line per element. The model currently gives every
-layer the same price. That is the most obvious remaining source of error, and it is derivable from
-the code rather than from measurement.
+A clear next refinement would seem to be charging by **actual stride against the cache line**,
+since a RadixN cross layer strides by a `num_columns` that grows with every layer. That was tried
+and it is a regression on both backends; see the MixedRadix-versus-GoodThomas section below for
+the numbers and for why the reasoning was wrong.
 
 ## The one structural correction the experiment forced
 
@@ -257,6 +256,77 @@ against six Bluestein's variants, so "best measured" is mildly biased toward Blu
 better Rader's inner could flip a close call. It does not look fatal here, since Rader's still wins
 outright at 6 of 15 lengths, but the near-ties (991, 1009 on SSE, 100049 on SSE) should not be
 read as settled. Widening the Rader's side of the enumeration is the obvious follow-up.
+
+## MixedRadix versus GoodThomas, and choosing between splits
+
+Analysed offline from the dumps already taken, comparing every pair where the same factor split
+appears as both a MixedRadix and a GoodThomas (142 such pairs per backend).
+
+| | NEON | SSE |
+|---|---|---|
+| MR vs GT on the same factor pair | 121 / 142 | **38 / 142** |
+| mean cost of a wrong call | 1.029x | 1.041x |
+| worst cost of a wrong call | 1.076x | 1.255x |
+| choosing among two-way splits, 27 lengths | mean 1.024, worst 1.108 | mean 1.088, worst 1.371 |
+
+### The model does not actually decide this; it has a fixed preference
+
+The 38/142 is not noise, it is structural. The model prefers GoodThomas at **142 of 142** pairs on
+both backends. On NEON that happens to match the truth, which also prefers GoodThomas 121 of 142
+times; on SSE the truth prefers GoodThomas only 38 times, so the same fixed preference is wrong
+104 times.
+
+The reason is visible in the formula. With the same factor pair, the two inner FFTs are identical,
+so the whole comparison is overhead against overhead:
+
+```
+cost_gt - cost_mr = len * [ 2s*(2*scatter - 2*strided - 1) - mul_complex ]
+```
+
+which is a constant multiple of `len`. Its sign cannot change from one length to the next, so the
+model can only ever answer "always GT" or "always MR". Sweeping the weights confirms it: accuracy
+takes exactly two values, 85% or 14% on NEON and 26% or 73% on SSE, with nothing in between.
+
+### But the decision is nearly a tie, which bounds how much this matters
+
+Measured `gt/mr` ratios sit in 0.90 to 0.98 on NEON and 0.96 to 1.07 on SSE. The two algorithms are
+within a few percent almost everywhere, which is why a wrong call costs 3 to 4% on average. That is
+right at the model's resolution: the 2026-09 spike established that decisions worth making are
+typically 20% apart, and this one is not.
+
+It also means a **fixed per-backend preference is close to optimal for this decision**: "prefer
+GoodThomas on NEON, prefer MixedRadix on SSE" scores 85% and 73%, which is what the degenerate
+model already does once its weights are fitted per backend. The residual is the 1.255x tail on SSE.
+
+### Argument order is a genuine blind spot
+
+`mr(A,B)` and `mr(B,A)` get **identical** cost from the model, all 415 reversed pairs tied exactly,
+yet 179 of them on NEON and 133 on SSE differ by more than 2% when measured. The cost function is
+symmetric in its two children while the algorithm is not: `width` and `height` play different roles
+in the transposes and in which FFT runs over contiguous rows. Making the model asymmetric in width
+and height is the clearest unexploited improvement.
+
+### A refinement that was predicted to help, and did not
+
+The previous section of this document proposed charging memory by **actual stride against the cache
+line** as the obvious next step, since a RadixN cross layer strides by a `num_columns` that grows
+each layer. That was implemented and measured, and it is a **regression**:
+
+| model | NEON mean / worst | SSE mean / worst |
+|---|---|---|
+| committed, flat pattern multipliers | **1.003 / 1.043** | **1.052 / 1.152** |
+| stride-aware, saturating at the cache line | 1.109 / 1.575 | 1.031 / 1.213 |
+| stride-aware, cross layers exempt while the chunk is cache-resident | 1.062 / 1.301 | 1.106 / 1.323 |
+
+It does fix the sub-decision it was aimed at, taking SSE's MR-vs-GT from 38/142 to 104/142, but it
+loses more elsewhere than it gains there. Reading the code says why the first version was wrong:
+`cross_layer` walks `chunks_exact_mut(cross_fft_len)` and every row it gathers lives inside the
+current chunk, so a cache-resident chunk is touched once no matter how large the stride is.
+Exempting those layers recovers part of the NEON loss but not all of it, and costs SSE.
+
+The change was reverted. The lesson is the same one the Rader's and the SSE cases taught in the
+other direction: **more detail is not automatically more accuracy**, and a term has to be checked
+against the whole set rather than against the decision that motivated it.
 
 ## Caveats
 

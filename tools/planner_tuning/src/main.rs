@@ -793,6 +793,69 @@ fn cmd_explain(spec_text: &str, opts: &Options) {
     }
 }
 
+/// Print the model's cost for every measured candidate, for offline analysis.
+///
+/// Columns: len, spec, measured ns, model cost. Pure replay, no machine needed.
+fn cmd_costs(path: &str, opts: &Options) {
+    use std::collections::BTreeMap;
+    let text = std::fs::read_to_string(path).expect("cannot read dump");
+    let mut params = opts.params;
+    if !opts.backend_explicit {
+        if let Some(b) = text
+            .lines()
+            .find_map(|l| l.strip_prefix("# planner\t"))
+            .and_then(counted::Backend::parse)
+        {
+            params.backend = b;
+        }
+    }
+    let model = counted::CountedModel::new(params);
+
+    let mut data: BTreeMap<usize, BTreeMap<String, (f64, bool)>> = BTreeMap::new();
+    for line in text.lines() {
+        if line.starts_with('#') || line.starts_with("len\t") {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let (len, spec, ns, pass, pick) = (
+            f[0].parse::<usize>().unwrap(),
+            f[1].to_string(),
+            f[2].parse::<f64>().unwrap(),
+            f[3].parse::<u32>().unwrap(),
+            f[4] == "1",
+        );
+        let e = data.entry(len).or_default();
+        match e.get(&spec) {
+            Some(_) if pass == 1 => {}
+            _ => {
+                e.insert(spec, (ns, pick));
+            }
+        }
+    }
+
+    println!("len\tspec\tns\tcost\tplanner_pick");
+    for (len, rows) in &data {
+        for (spec_text, (ns, pick)) in rows {
+            let cost = parse(spec_text)
+                .ok()
+                .and_then(|s| model.cost(&s))
+                .map(|c| format!("{:.1}", c))
+                .unwrap_or_else(|| "NA".into());
+            println!(
+                "{}\t{}\t{:.3}\t{}\t{}",
+                len,
+                spec_text,
+                ns,
+                cost,
+                if *pick { 1 } else { 0 }
+            );
+        }
+    }
+}
+
 fn cmd_model<T: FftNum, P: TunablePlanner<T>>(train: &[usize], test: &[usize], opts: &Options) {
     let max_len = test.iter().chain(train.iter()).copied().max().unwrap_or(1024) * 4;
 
@@ -945,6 +1008,7 @@ enum Command {
     Dump(Vec<usize>),
     Score(String),
     Explain(String),
+    Costs(String),
 }
 
 fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
@@ -962,6 +1026,7 @@ fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
         Command::Dump(lengths) => cmd_dump::<T, P>(lengths, opts),
         Command::Score(path) => cmd_score(path, opts),
         Command::Explain(spec) => cmd_explain(spec, opts),
+        Command::Costs(path) => cmd_costs(path, opts),
     }
 }
 
@@ -1077,6 +1142,7 @@ fn main() {
         "dump" => Command::Dump(numbers(&rest)),
         "score" => Command::Score(rest[0].clone()),
         "explain" => Command::Explain(rest[0].clone()),
+        "costs" => Command::Costs(rest[0].clone()),
         "model" => {
             let lengths = numbers(&rest);
             let split = lengths

@@ -26,8 +26,8 @@ def model_picks(dump, args):
             res[int(p[0])]=(float(p[1].rstrip('x')), ' '.join(p[3:]))
     return res
 
-NEON=['--seq-l2','1.5','--seq-dram','6.0','--strided','1.5','--permuted','1.5','--rader-index','50']
-SSE =['--seq-l2','2.0','--seq-dram','6.0','--strided','2.5','--permuted','1.5','--rader-index','50','--radixn-extra','5']
+NEON=['--seq-l2','1.5','--seq-dram','6.0','--blocked','1.5','--rader-index','50']
+SSE =['--seq-l2','2.0','--seq-dram','6.0','--blocked','2.5','--rader-index','50','--radixn-extra','5']
 
 for name,dump,args in (('NEON','dump_neon_primes.tsv',NEON),('SSE','dump_sse_primes.tsv',SSE)):
     rows,pick=load(dump); mp=model_picks(dump,args)
