@@ -1,0 +1,225 @@
+//! A cost model built by counting instructions in the source, not by measuring.
+//!
+//! Every leaf cost here comes from reading `src/neon/*.rs`; the derivation is written up in
+//! `OP-COUNTS.md`. On top of the arithmetic count sits a coarse memory term: each pass over the
+//! buffer is charged per element touched, scaled by how it walks memory (sequential, strided, or
+//! permuted) and by which level of an *assumed* cache hierarchy the working set lands in.
+//!
+//! The point of the exercise is that nothing in here needs a machine. The only quantities that
+//! are not read off the source are the handful of weights in `Params`, which set the price of a
+//! memory access relative to one arithmetic instruction.
+
+use rustfft::tuning::Spec;
+
+/// Instructions for one `perform_fft_direct`, excluding the load and store of each element.
+/// Hand-counted from `src/neon/neon_butterflies.rs`; see `OP-COUNTS.md`.
+pub fn butterfly_compute(len: usize) -> Option<f64> {
+    let v = match len {
+        1 => 0,
+        2 => 2,
+        3 => 8,
+        4 => 10,
+        5 => 28,
+        6 => 22,
+        8 => 38,
+        9 => 64,
+        10 => 66,
+        12 => 62,
+        15 => 124,
+        16 => 114,
+        24 => 201,
+        32 => 314,
+        // Generated prime butterflies: closed form (h-1)(2h+5) with h = (len+1)/2, verified
+        // against a histogram of the generated source for all eight lengths.
+        7 | 11 | 13 | 17 | 19 | 23 | 29 | 31 => {
+            let h = (len + 1) / 2;
+            (h - 1) * (2 * h + 5)
+        }
+        _ => return None,
+    };
+    Some(v as f64)
+}
+
+/// `NeonVector::mul_complex` on f64: vcombine + vneg + vmulq_laneq + vfmaq_laneq.
+const MUL_COMPLEX: f64 = 4.0;
+/// `NeonVector::column_butterfly4`: four column_butterfly2 plus one apply_rotate90.
+const COLUMN_BUTTERFLY4: f64 = 10.0;
+
+/// How a pass walks memory.
+#[derive(Copy, Clone)]
+pub enum Pattern {
+    /// Contiguous run, one cache line feeding many elements.
+    Sequential,
+    /// Fixed stride greater than a line, as in a transpose or a cross-FFT layer.
+    Strided,
+    /// Data-dependent scatter or gather: digit reversal, CRT reindexing, Rader's permutation.
+    Permuted,
+}
+
+/// The weights that are not read off the source.
+///
+/// Costs are in units of one arithmetic instruction. `seq` is the price of a single load or
+/// store at each level of the hierarchy; the multipliers raise that for less friendly patterns.
+#[derive(Copy, Clone, Debug)]
+pub struct Params {
+    /// Complex numbers that fit in the first level of cache.
+    pub l1_elems: f64,
+    /// Complex numbers that fit in the last level of cache.
+    pub l2_elems: f64,
+    /// Cost of one load or store at L1, L2 and memory.
+    pub seq: [f64; 3],
+    pub strided_mult: f64,
+    pub permuted_mult: f64,
+    /// Cost of computing one Rader's permutation index, in arithmetic-instruction equivalents.
+    ///
+    /// `raders_algorithm.rs` recomputes `index = index * root % len` per element, where `len` is
+    /// a `StrengthReducedU64`, so that `%` is two 64x64->128 widening multiplies plus a shift and
+    /// a subtract: about 7 instructions on aarch64. The instruction count alone understates it,
+    /// because `index` feeds the next iteration, making the chain loop-carried and latency-bound
+    /// rather than throughput-bound. This weight converts the counted instructions into the
+    /// effective cost of that serial chain.
+    pub rader_index: f64,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        // Apple M1 performance core: 128 KiB L1d, 12 MiB L2, at 16 bytes per complex f64.
+        Self {
+            l1_elems: 8192.0,
+            l2_elems: 786432.0,
+            seq: [1.0, 2.0, 6.0],
+            strided_mult: 1.5,
+            permuted_mult: 2.5,
+            rader_index: 20.0,
+        }
+    }
+}
+
+pub struct CountedModel {
+    pub params: Params,
+}
+
+impl CountedModel {
+    pub fn new(params: Params) -> Self {
+        Self { params }
+    }
+
+    /// Cost of touching `accesses` elements (counting each load and each store once) with the
+    /// given pattern, when the enclosing buffer holds `ws` complex numbers.
+    fn mem(&self, accesses: f64, pattern: Pattern, ws: f64) -> f64 {
+        let p = &self.params;
+        let level = if ws <= p.l1_elems {
+            0
+        } else if ws <= p.l2_elems {
+            1
+        } else {
+            2
+        };
+        let mult = match pattern {
+            Pattern::Sequential => 1.0,
+            Pattern::Strided => p.strided_mult,
+            Pattern::Permuted => p.permuted_mult,
+        };
+        accesses * p.seq[level] * mult
+    }
+
+    /// Estimated cost of one FFT of this recipe, in arithmetic-instruction equivalents.
+    ///
+    /// `None` if a butterfly length has no counted entry, so a gap fails loudly.
+    pub fn cost(&self, spec: &Spec) -> Option<f64> {
+        self.cost_ws(spec, spec.len() as f64)
+    }
+
+    /// `ws` is the working set of the whole transform, threaded down unchanged: every pass of
+    /// every nested algorithm walks the same top-level buffer, so that is what decides which
+    /// cache level the traffic is served from.
+    fn cost_ws(&self, spec: &Spec, ws: f64) -> Option<f64> {
+        let p = &self.params;
+        Some(match spec {
+            Spec::Dft(n) => {
+                let n = *n as f64;
+                100.0 * n * n
+            }
+            Spec::Butterfly(len) => {
+                butterfly_compute(*len)? + self.mem(2.0 * *len as f64, Pattern::Sequential, ws)
+            }
+            Spec::Radix4 { k, base } => {
+                let len = spec.len() as f64;
+                let reps = len / base.len() as f64;
+                // One digit-reversal transpose, then the base FFTs, then k cross layers.
+                let mut c = self.mem(2.0 * len, Pattern::Permuted, ws);
+                c += reps * self.cost_ws(base, ws)?;
+                for _ in 0..*k {
+                    // len/4 column_butterfly4, each with three twiddle multiplies.
+                    c += (len / 4.0) * (COLUMN_BUTTERFLY4 + 3.0 * MUL_COMPLEX);
+                    c += self.mem(2.0 * len, Pattern::Strided, ws);
+                }
+                c
+            }
+            Spec::RadixN { radixes, base } => {
+                let len = spec.len() as f64;
+                let reps = len / base.len() as f64;
+                let mut c = self.mem(2.0 * len, Pattern::Permuted, ws);
+                c += reps * self.cost_ws(base, ws)?;
+                for r in radixes.iter() {
+                    let rf = *r as f64;
+                    // The cross-FFT layers call the very same butterfly kernels, so the counted
+                    // table applies directly. Row 0 needs no twiddle, hence r - 1.
+                    c += (len / rf) * (butterfly_compute(*r)? + (rf - 1.0) * MUL_COMPLEX);
+                    c += self.mem(2.0 * len, Pattern::Strided, ws);
+                }
+                c
+            }
+            Spec::MixedRadix { left, right, small } => {
+                let len = spec.len() as f64;
+                let pat = if *small {
+                    Pattern::Permuted
+                } else {
+                    Pattern::Strided
+                };
+                // Three transposes, one full twiddle pass, two inner dimensions.
+                let mut c = 3.0 * self.mem(2.0 * len, pat, ws);
+                c += len * MUL_COMPLEX + self.mem(2.0 * len, Pattern::Sequential, ws);
+                c += right.len() as f64 * self.cost_ws(left, ws)?;
+                c += left.len() as f64 * self.cost_ws(right, ws)?;
+                c
+            }
+            Spec::GoodThomas { left, right, small } => {
+                let len = spec.len() as f64;
+                let pat = if *small {
+                    Pattern::Permuted
+                } else {
+                    Pattern::Strided
+                };
+                // Two CRT reindexing passes and one transpose, but no twiddle multiplies at all:
+                // dropping them is the whole point of Good-Thomas, and it pays in index work.
+                let mut c = 2.0 * self.mem(2.0 * len, Pattern::Permuted, ws);
+                c += self.mem(2.0 * len, pat, ws);
+                c += right.len() as f64 * self.cost_ws(left, ws)?;
+                c += left.len() as f64 * self.cost_ws(right, ws)?;
+                c
+            }
+            Spec::Raders { inner } => {
+                let len = spec.len() as f64;
+                // The inner FFT runs twice, and the permutation is precomputed into a u32 table,
+                // so it is a gather and a scatter rather than a modular multiply per element.
+                let mut c = 2.0 * self.cost_ws(inner, ws)?;
+                // Two permutation passes, each a scatter or gather whose index comes from a
+                // serial modular-multiply chain rather than from a table.
+                c += 2.0 * (self.mem(2.0 * len, Pattern::Permuted, ws) + len * p.rader_index);
+                c += len * MUL_COMPLEX + self.mem(2.0 * len, Pattern::Sequential, ws);
+                c
+            }
+            Spec::Bluesteins { len, inner } => {
+                let outer = *len as f64;
+                let ilen = inner.len() as f64;
+                // Inner FFT twice, pointwise multiply over the padded inner length, and a
+                // twiddle-and-pad pass in and out over the outer length.
+                let mut c = 2.0 * self.cost_ws(inner, ws)?;
+                c += ilen * MUL_COMPLEX + self.mem(2.0 * ilen, Pattern::Sequential, ws);
+                c += 2.0 * (outer * MUL_COMPLEX + self.mem(2.0 * outer, Pattern::Sequential, ws));
+                c
+            }
+        })
+    }
+}
