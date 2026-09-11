@@ -455,6 +455,52 @@ been flattering the model. As of 2026-09-11 it is still not reachable: `~/.ssh/c
 `Host pi5` with no user or key and the name does not resolve. It needs a reachable address, the
 `id_ed25519` public key in its `authorized_keys`, and a Rust toolchain.
 
+## Out of cache: the regime the 2021 attempt died in
+
+Everything above was measured in cache. The footprint of a transform is `2*len*16` bytes, since
+both MixedRadix and GoodThomas hold a scratch of `len`, so the 33-length survey tops out at 3.2 MiB
+at length 102400 and never leaves the last level on any machine tested. That matters because the
+2021 scalar model's failures were precisely out there: it lost 30% at 100k and 60% at 1M, and the
+recorded diagnosis was that it was cache-blind.
+
+Ten lengths from 500000 to 2097152, footprints 15 to 64 MiB against the M1's 12 MiB L2, so
+genuinely memory-bound:
+
+| | mean | median | worst |
+|---|---|---|---|
+| counted model | **1.0110** | 1.0000 | **1.0432** |
+| shipping planner | 1.0218 | 1.0030 | 1.1307 |
+
+Worst-case 1.0432, against 1.0427 in cache. **The model does not degrade when the working set
+leaves cache.** It picks the outright best recipe at 6 of 10, and its single worst length is 999999,
+which carries a factor of 37 and so needs a prime algorithm nested inside a split.
+
+Note the planner also does much better here (worst 1.131 against 1.495 on the mixed-factor
+composites), because these lengths are mostly smooth and land on shapes its fixed rules handle
+well. The window is narrower out here; the model still wins it.
+
+### The cache-level term is inert even here, and now it is clear why
+
+The ablation that removes the L1/L2/DRAM distinction entirely was run again on these ten lengths,
+and on sweeps of the DRAM weight up to eight times its fitted value:
+
+| variant | mean | worst |
+|---|---|---|
+| cache-flat, one cost everywhere | 1.0107 | 1.0407 |
+| tuned | 1.0110 | 1.0432 |
+| DRAM weight x4 | 1.0110 | 1.0432 |
+| DRAM weight x8 | 1.0110 | 1.0432 |
+
+So the earlier finding was not an artefact of testing only cache-resident sizes. The reason is
+simple in hindsight: **at a given length every candidate touches about the same amount of data**,
+differing only in how many passes it makes over it, so the cache level enters as a common factor
+that scales all candidates together and cannot reorder them. That is the same mechanism behind the
+observation recorded under option G, that a working-set change moved both of two candidates about
+equally.
+
+This strengthens the case for dropping the assumed cache sizes from any shipping version: they are
+now shown to be inert across three orders of magnitude of working set, in cache and out.
+
 ## Caveats
 
 1. **One backend, one float type, one machine.** NEON f64 on an M1. Nothing here shows the weights
