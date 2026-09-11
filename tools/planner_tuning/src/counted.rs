@@ -11,39 +11,105 @@
 
 use rustfft::tuning::Spec;
 
-/// Instructions for one `perform_fft_direct`, excluding the load and store of each element.
-/// Hand-counted from `src/neon/neon_butterflies.rs`; see `OP-COUNTS.md`.
-pub fn butterfly_compute(len: usize) -> Option<f64> {
-    let v = match len {
-        1 => 0,
-        2 => 2,
-        3 => 8,
-        4 => 10,
-        5 => 28,
-        6 => 22,
-        8 => 38,
-        9 => 64,
-        10 => 66,
-        12 => 62,
-        15 => 124,
-        16 => 114,
-        24 => 201,
-        32 => 314,
-        // Generated prime butterflies: closed form (h-1)(2h+5) with h = (len+1)/2, verified
-        // against a histogram of the generated source for all eight lengths.
-        7 | 11 | 13 | 17 | 19 | 23 | 29 | 31 => {
-            let h = (len + 1) / 2;
-            (h - 1) * (2 * h + 5)
-        }
-        _ => return None,
-    };
-    Some(v as f64)
+/// Which backend's kernels to price. The decomposition each butterfly uses is the same on both,
+/// but the instruction cost of the primitives is not: SSE4.1 has no FMA, so `fmadd` is a separate
+/// multiply and add, and its complex multiply needs six instructions rather than four.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Backend {
+    Neon,
+    Sse,
 }
 
-/// `NeonVector::mul_complex` on f64: vcombine + vneg + vmulq_laneq + vfmaq_laneq.
-const MUL_COMPLEX: f64 = 4.0;
-/// `NeonVector::column_butterfly4`: four column_butterfly2 plus one apply_rotate90.
-const COLUMN_BUTTERFLY4: f64 = 10.0;
+impl Backend {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "neon" => Some(Backend::Neon),
+            "sse" => Some(Backend::Sse),
+            _ => None,
+        }
+    }
+
+    /// `NeonVector::mul_complex` is 4 instructions; `SseVector::mul_complex` is 6
+    /// (unpacklo, unpackhi, two muls, shuffle, addsub).
+    pub fn mul_complex(&self) -> f64 {
+        match self {
+            Backend::Neon => 4.0,
+            Backend::Sse => 6.0,
+        }
+    }
+
+    /// `column_butterfly4` is four `column_butterfly2` plus one `apply_rotate90` on both.
+    pub fn column_butterfly4(&self) -> f64 {
+        10.0
+    }
+
+    /// Architectural vector registers: 32 `v` registers on aarch64, 16 `xmm` on x86-64 SSE.
+    ///
+    /// This matters because `cross_layer` in `src/simd_radixn.rs` gathers **two** vector columns
+    /// before transforming either, so a radix-R layer holds 2R rows live at once, plus the
+    /// butterfly's own temporaries. At radix 7 that is 14 rows before temporaries, which fits
+    /// comfortably in 32 registers and not at all in 16.
+    pub fn registers(&self) -> f64 {
+        match self {
+            Backend::Neon => 32.0,
+            Backend::Sse => 16.0,
+        }
+    }
+
+    /// Instructions for one `perform_fft_direct`, excluding the load and store of each element.
+    /// Hand-counted from `src/neon/neon_butterflies.rs` and `src/sse/sse_butterflies.rs`; the
+    /// derivation is in `OP-COUNTS.md`.
+    pub fn butterfly_compute(&self, len: usize) -> Option<f64> {
+        // The generated prime butterflies come out as a closed form, because the generator is a
+        // pair of loops. Only the weight of the fmadd chain differs between the backends.
+        if matches!(len, 7 | 11 | 13 | 17 | 19 | 23 | 29 | 31) {
+            let h = ((len + 1) / 2) as f64;
+            return Some(match self {
+                Backend::Neon => (h - 1.0) * (2.0 * h + 5.0),
+                Backend::Sse => (h - 1.0) * (4.0 * h + 2.0),
+            });
+        }
+        let v = match self {
+            Backend::Neon => match len {
+                1 => 0,
+                2 => 2,
+                3 => 8,
+                4 => 10,
+                5 => 28,
+                6 => 22,
+                8 => 38,
+                9 => 64,
+                10 => 66,
+                12 => 62,
+                15 => 124,
+                16 => 114,
+                24 => 201,
+                32 => 314,
+                _ => return None,
+            },
+            // Same decompositions, but bf3 is written without FMA (10, not a re-weighted 8) and
+            // bf8 reaches for rotate_45/rotate_135 where NEON uses explicit multiplies.
+            Backend::Sse => match len {
+                1 => 0,
+                2 => 2,
+                3 => 10,
+                4 => 10,
+                5 => 28,
+                6 => 26,
+                8 => 38,
+                9 => 84,
+                10 => 66,
+                12 => 70,
+                15 => 134,
+                16 => 122,
+                24 => 233,
+                32 => 346,
+                _ => return None,
+            },
+        };
+        Some(v as f64)
+    }
+}
 
 /// How a pass walks memory.
 #[derive(Copy, Clone)]
@@ -79,6 +145,25 @@ pub struct Params {
     /// rather than throughput-bound. This weight converts the counted instructions into the
     /// effective cost of that serial chain.
     pub rader_index: f64,
+    /// Cost of one spilled vector per unrolled group in a RadixN cross layer, as a store plus a
+    /// reload. Zero disables the register-pressure term entirely.
+    pub spill: f64,
+    /// Extra cost per element per cross-FFT layer for the **generic** `SimdRadixN` driver,
+    /// over the hand-written `Radix4` kernel doing the same work.
+    ///
+    /// They are different code. `cross_layer` in `src/simd_radixn.rs` is generic over the radix
+    /// and gathers two vector columns before transforming either, so it holds 2R rows live plus
+    /// the butterfly's temporaries; `sse_radix4.rs` is a hardcoded 2x unroll over six twiddles.
+    /// 2R rows fits aarch64's 32 vector registers at every radix it supports, and does not fit
+    /// x86-64's 16 xmm registers, so this is expected to be near zero on NEON and positive on SSE.
+    pub radixn_extra: f64,
+    /// Override for the cost of one complex multiply. Negative means "use the backend's counted
+    /// value". Exists to test whether SSE's shuffle-heavy `mul_complex` costs more than its
+    /// instruction count suggests: three of its six instructions are shuffle-class, and on Intel
+    /// those all issue to a single port, whereas NEON spreads them over symmetric pipes.
+    pub mul_complex: f64,
+    /// Which backend's instruction costs to use.
+    pub backend: Backend,
 }
 
 impl Default for Params {
@@ -91,6 +176,10 @@ impl Default for Params {
             strided_mult: 1.5,
             permuted_mult: 2.5,
             rader_index: 20.0,
+            spill: 0.0,
+            radixn_extra: 0.0,
+            mul_complex: -1.0,
+            backend: Backend::Neon,
         }
     }
 }
@@ -102,6 +191,15 @@ pub struct CountedModel {
 impl CountedModel {
     pub fn new(params: Params) -> Self {
         Self { params }
+    }
+
+    /// The complex-multiply cost actually in force.
+    fn mul_complex(&self) -> f64 {
+        if self.params.mul_complex >= 0.0 {
+            self.params.mul_complex
+        } else {
+            self.params.backend.mul_complex()
+        }
     }
 
     /// Cost of touching `accesses` elements (counting each load and each store once) with the
@@ -141,7 +239,7 @@ impl CountedModel {
                 100.0 * n * n
             }
             Spec::Butterfly(len) => {
-                butterfly_compute(*len)? + self.mem(2.0 * *len as f64, Pattern::Sequential, ws)
+                p.backend.butterfly_compute(*len)? + self.mem(2.0 * *len as f64, Pattern::Sequential, ws)
             }
             Spec::Radix4 { k, base } => {
                 let len = spec.len() as f64;
@@ -151,7 +249,7 @@ impl CountedModel {
                 c += reps * self.cost_ws(base, ws)?;
                 for _ in 0..*k {
                     // len/4 column_butterfly4, each with three twiddle multiplies.
-                    c += (len / 4.0) * (COLUMN_BUTTERFLY4 + 3.0 * MUL_COMPLEX);
+                    c += (len / 4.0) * (p.backend.column_butterfly4() + 3.0 * self.mul_complex());
                     c += self.mem(2.0 * len, Pattern::Strided, ws);
                 }
                 c
@@ -165,8 +263,17 @@ impl CountedModel {
                     let rf = *r as f64;
                     // The cross-FFT layers call the very same butterfly kernels, so the counted
                     // table applies directly. Row 0 needs no twiddle, hence r - 1.
-                    c += (len / rf) * (butterfly_compute(*r)? + (rf - 1.0) * MUL_COMPLEX);
+                    c += (len / rf) * (p.backend.butterfly_compute(*r)? + (rf - 1.0) * self.mul_complex());
                     c += self.mem(2.0 * len, Pattern::Strided, ws);
+                    c += len * p.radixn_extra;
+                    // Register pressure: the layer keeps 2R rows live across the two-column
+                    // unroll. Anything past the architectural register file becomes a spill and a
+                    // reload, once per element of the group.
+                    if p.spill > 0.0 {
+                        let live = 2.0 * rf;
+                        let over = (live - p.backend.registers()).max(0.0);
+                        c += over * p.spill * (len / rf);
+                    }
                 }
                 c
             }
@@ -179,7 +286,7 @@ impl CountedModel {
                 };
                 // Three transposes, one full twiddle pass, two inner dimensions.
                 let mut c = 3.0 * self.mem(2.0 * len, pat, ws);
-                c += len * MUL_COMPLEX + self.mem(2.0 * len, Pattern::Sequential, ws);
+                c += len * self.mul_complex() + self.mem(2.0 * len, Pattern::Sequential, ws);
                 c += right.len() as f64 * self.cost_ws(left, ws)?;
                 c += left.len() as f64 * self.cost_ws(right, ws)?;
                 c
@@ -207,7 +314,7 @@ impl CountedModel {
                 // Two permutation passes, each a scatter or gather whose index comes from a
                 // serial modular-multiply chain rather than from a table.
                 c += 2.0 * (self.mem(2.0 * len, Pattern::Permuted, ws) + len * p.rader_index);
-                c += len * MUL_COMPLEX + self.mem(2.0 * len, Pattern::Sequential, ws);
+                c += len * self.mul_complex() + self.mem(2.0 * len, Pattern::Sequential, ws);
                 c
             }
             Spec::Bluesteins { len, inner } => {
@@ -216,8 +323,8 @@ impl CountedModel {
                 // Inner FFT twice, pointwise multiply over the padded inner length, and a
                 // twiddle-and-pad pass in and out over the outer length.
                 let mut c = 2.0 * self.cost_ws(inner, ws)?;
-                c += ilen * MUL_COMPLEX + self.mem(2.0 * ilen, Pattern::Sequential, ws);
-                c += 2.0 * (outer * MUL_COMPLEX + self.mem(2.0 * outer, Pattern::Sequential, ws));
+                c += ilen * self.mul_complex() + self.mem(2.0 * ilen, Pattern::Sequential, ws);
+                c += 2.0 * (outer * self.mul_complex() + self.mem(2.0 * outer, Pattern::Sequential, ws));
                 c
             }
         })

@@ -285,6 +285,7 @@ struct Options {
     out: Option<String>,
     /// Weights for the counted model.
     params: counted::Params,
+    backend_explicit: bool,
 }
 
 fn cmd_time<T: FftNum, P: TunablePlanner<T>>(specs: &[String], opts: &Options) {
@@ -640,8 +641,20 @@ fn cmd_score(path: &str, opts: &Options) {
         }
     }
 
-    let model = counted::CountedModel::new(opts.params);
-    println!("params: {:?}", opts.params);
+    // Take the backend from the dump header unless it was given explicitly, so an SSE dump is
+    // never priced with NEON instruction costs by accident.
+    let mut params = opts.params;
+    if !opts.backend_explicit {
+        if let Some(label) = text
+            .lines()
+            .find_map(|l| l.strip_prefix("# planner\t"))
+            .and_then(counted::Backend::parse)
+        {
+            params.backend = label;
+        }
+    }
+    let model = counted::CountedModel::new(params);
+    println!("params: {:?}", params);
     println!(
         "{:>9} {:>9} {:>9}   {}",
         "len", "counted", "planner", "counted model's pick (when it is not the best)"
@@ -1000,6 +1013,7 @@ fn main() {
         bucketed: false,
         out: None,
         params: counted::Params::default(),
+        backend_explicit: false,
     };
     let mut f32_mode = false;
     let mut rest: Vec<String> = Vec::new();
@@ -1035,6 +1049,10 @@ fn main() {
             "--strided" => { i += 1; opts.params.strided_mult = args[i].parse().unwrap(); }
             "--permuted" => { i += 1; opts.params.permuted_mult = args[i].parse().unwrap(); }
             "--rader-index" => { i += 1; opts.params.rader_index = args[i].parse().unwrap(); }
+            "--radixn-extra" => { i += 1; opts.params.radixn_extra = args[i].parse().unwrap(); }
+            "--mul-complex" => { i += 1; opts.params.mul_complex = args[i].parse().unwrap(); }
+            "--spill" => { i += 1; opts.params.spill = args[i].parse().unwrap(); }
+            "--backend" => { i += 1; opts.params.backend = counted::Backend::parse(&args[i]).expect("--backend wants neon or sse"); opts.backend_explicit = true; }
             "--l1-elems" => { i += 1; opts.params.l1_elems = args[i].parse().unwrap(); }
             "--l2-elems" => { i += 1; opts.params.l2_elems = args[i].parse().unwrap(); }
             "--verbose" => opts.verbose = true,

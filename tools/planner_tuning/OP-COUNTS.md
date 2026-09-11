@@ -1,4 +1,4 @@
-# NEON f64 operation counts, and how they were derived
+# NEON and SSE f64 operation counts, and how they were derived
 
 Every number here was obtained by **reading the source**, not by benchmarking. The unit is one
 issued NEON instruction. The counts feed the analytic cost model as leaf costs, replacing the
@@ -100,3 +100,46 @@ Verified against a direct histogram of the generated source for all eight length
 
 The shape is the expected one: powers of two are cheapest per element, the prime butterflies grow
 roughly linearly in `len` because they are O(n^2) kernels, and the composites sit in between.
+
+## SSE f64
+
+Counted the same way, from `src/sse/sse_vector.rs`, `src/sse/sse_utils.rs` and
+`src/sse/sse_butterflies.rs`. The decompositions are the same as NEON's; the primitive costs are
+not, because SSE4.1 has no FMA.
+
+| primitive | NEON | SSE | SSE derivation |
+|---|---|---|---|
+| `fmadd` / `nmadd` | 1 | **2** | `_mm_mul_pd` plus `_mm_add_pd` / `_mm_sub_pd` |
+| `mul_complex` | 4 | **6** | `_mm_unpacklo_pd`, `_mm_unpackhi_pd`, two `_mm_mul_pd`, `_mm_shuffle_pd`, `_mm_addsub_pd` |
+| `apply_rotate90`, `Rotate90F64::rotate` | 2 | 2 | `_mm_shuffle_pd` + `_mm_xor_pd` |
+| `rotate_45` / `_135` / `_225` | 4 | 4 | rotate, then add or sub, then mul |
+| `column_butterfly2`, `solo_fft2_f64` | 2 | 2 | add + sub |
+| `column_butterfly4` | 10 | 10 | four `column_butterfly2` plus one `apply_rotate90` |
+| `add`, `mul`, `neg`, load, store | 1 | 1 | one instruction each |
+
+Prime butterflies re-derive to `(h-1)(4h+2)`, since only the `fmadd` chain changes weight. Verified
+exactly against a histogram of `src/sse/sse_prime_butterflies.rs` for all eight lengths: 7 -> 54,
+11 -> 130, 13 -> 180, 17 -> 304, 19 -> 378, 23 -> 550, 29 -> 868, 31 -> 990.
+
+Hand-written butterflies. **Two of these are not the NEON figure re-weighted**, which is why the
+SSE source was counted rather than scaled:
+
+| len | compute | note |
+|---|---|---|
+| 1 | 0 | |
+| 2 | 2 | |
+| 3 | **10** | written without FMA as 4 add + 2 mul + 2 sub + 1 rotate, not NEON's 8 re-weighted to 11 |
+| 4 | 10 | |
+| 5 | 28 | |
+| 6 | 26 | 2 x bf3 + 3 x solo_fft2 |
+| 8 | **38** | uses `rotate_45` and `rotate_135` where NEON uses explicit multiplies; lands on the same total by coincidence |
+| 9 | 84 | 6 x bf3 + 4 x mul_complex |
+| 10 | 66 | 2 x bf5 + 5 x bf2, Good-Thomas, no twiddles |
+| 12 | 70 | 3 x bf4 + 4 x bf3 |
+| 15 | 134 | 3 x bf5 + 5 x bf3 |
+| 16 | 122 | 8 x bf4 + 4 x mul_complex + rotations |
+| 24 | 233 | 6 x bf4 + 4 x bf6 + 8 x mul_complex + neg + rotations |
+| 32 | 346 | 8 x bf4 + 4 x bf8 + 16 x mul_complex + rotations |
+
+As on NEON, `src/sse/sse_radixn.rs` wires its cross-FFT layers to these same
+`SseF64ButterflyN::perform_fft_direct` functions, so the table applies to RadixN directly.

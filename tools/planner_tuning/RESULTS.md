@@ -1,9 +1,14 @@
 # Counted-op cost model: experiment result
 
-**Verdict: the idea works, and comfortably clears the bar.** On NEON f64 over the 33-length
-survey, a cost model built entirely from reading the source picks a recipe within **4.3% of the
-fastest in the worst case** and within 0.3% on average, against a target of "reliably within 20%,
-10% would be amazing".
+**Verdict: the idea works, on two architectures, and clears the bar on both.** A cost model built
+entirely from reading the source picks a recipe within **4.3% of the fastest in the worst case on
+NEON** and **15.2% on SSE**, against a target of "reliably within 20%, 10% would be amazing". Both
+results hold on a held-out half of the lengths.
+
+The op counts are read per backend, as expected for different instruction sets. Beyond that, three
+weights differ between NEON and SSE, and one of them, a penalty for the generic RadixN driver
+against the hand-written Radix4 kernel, is not a fudge: it is exactly zero on NEON and positive on
+SSE, matching a register-count argument. See the SSE section.
 
 ## Numbers
 
@@ -137,6 +142,78 @@ and latency-bound rather than throughput-bound.
 Pricing that chain took worst-case from 1.615 to 1.167, and the remaining memory-weight tuning took
 it to 1.043. This is the pattern to expect: **a bad number means a missing term, not a wrong
 weight.** It is the same diagnostic that found the doubled Rader's inner FFT in the 2026-09 work.
+
+## Cross-backend: SSE on the ThinkCentre
+
+The claim the whole idea rests on is that this travels. It does, but **not with the same weights**,
+and the way it failed first is the useful part.
+
+Porting the op counts needed no measurement, only more reading. SSE4.1 has no FMA, so `fmadd` and
+`nmadd` cost 2 instructions instead of 1 and `mul_complex` costs 6 instead of 4. The prime
+butterfly closed form re-derives from `(h-1)(2h+5)` to `(h-1)(4h+2)`, verified exactly against all
+eight generated SSE sizes. Two butterflies would have been wrong had I re-weighted the NEON numbers
+mechanically instead of counting the SSE source: butterfly 3 is hand-written without FMA at 10
+instructions, and butterfly 8 uses `rotate_45`/`rotate_135` where NEON uses explicit multiplies.
+
+**First attempt: the NEON weights transferred badly.** Mean 1.183, worst 1.654, barely ahead of the
+SSE planner's 1.246 / 1.734. Every miss was an `rn(...)` pick, on composites and inside Bluestein's
+alike, so the model was systematically overrating RadixN on SSE. No setting of the existing five
+weights fixed it: the whole 108-point grid sat at worst 1.654. A missing term, not a wrong weight,
+which is the same diagnostic as the Rader's case.
+
+Length 10007 shows it plainly:
+
+| recipe | SSE ns |
+|---|---|
+| `bs(10007, r4(5,b24))`, the hand-written Radix4 kernel | 480,023 |
+| `bs(10007, rn(4.4.4.4.4.4,b5))`, the generic RadixN driver | 794,077 |
+
+Nearly the same radix-4 work, 1.65x apart. On NEON that *same* RadixN recipe is the best available.
+
+**The missing term is the generic driver, and it is readable from code plus one ISA constant.**
+`cross_layer` in `src/simd_radixn.rs` gathers two vector columns before transforming either, so a
+radix-R layer holds 2R rows live plus the butterfly's temporaries, while `sse_radix4.rs` is a
+hardcoded 2x unroll over six twiddles. 2R fits aarch64's 32 vector registers at every radix RadixN
+supports; it does not fit x86-64's 16 xmm registers. Adding one per-element-per-layer penalty for
+the generic driver gives:
+
+| | mean | median | p90 | worst |
+|---|---|---|---|---|
+| SSE planner | 1.2464 | 1.2323 | 1.4949 | 1.7337 |
+| counted, NEON weights | 1.1826 | 1.1495 | 1.3444 | 1.6542 |
+| **counted, SSE weights** | **1.0516** | **1.0490** | **1.1248** | **1.1515** |
+| counted, SSE weights, held-out half | 1.0520 | 1.0608 | 1.1318 | 1.1425 |
+
+That clears the 20% bar on a second architecture, and it holds out.
+
+**The penalty is not a fudge that could have been fitted anywhere.** On NEON its best value is
+exactly zero, and any positive value degrades NEON sharply (worst 1.043 at 0, 1.246 at 1, 1.507 at
+4). The term switches on for the backend whose register file cannot hold the working set, and off
+for the one that can, which is what the physical story predicts.
+
+### What actually differs per backend
+
+| | NEON | SSE |
+|---|---|---|
+| butterfly instruction counts | read from `src/neon/` | read from `src/sse/` |
+| generic-RadixN penalty | 0 | 5 |
+| strided access multiplier | 1.5 | 2.5 |
+| L2 access cost | 1.5 | 2.0 |
+| Rader's index chain, sequential/permuted, cache sizes | identical | identical |
+
+So the per-backend surface is one counted table plus three numbers. That is a different kind of
+maintenance burden from the measured model's 22 butterflies and 58 Radix4 shapes per backend per
+float type: the table is derived by reading code, and the three numbers are few enough to fit once
+and sanity-check rarely.
+
+### A side finding worth keeping
+
+This independently reproduces, and explains, the open question in `NOTES.md`: SSE measured f64
+RadixN at 0.80x over 109 lengths while NEON measured it winning 1.13-1.53x, and the discrepancy is
+what blocks `simd_radixn_split` upstream. The mechanism proposed here is register pressure in the
+generic `cross_layer` against x86-64's 16 xmm registers. That is a testable claim independent of
+any cost model: it predicts the gap shrinks for small radixes and widens for radix 6 and 7, and
+that an AVX build with 16 wider registers would not fix it while a hand-written SSE RadixN would.
 
 ## Caveats
 
