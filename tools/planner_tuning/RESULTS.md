@@ -413,6 +413,39 @@ machine-dependent part is three numbers whose misuse costs 0.06 to 0.25 of worst
 is a far better maintenance story than the measured table, but it is **not** "no measurement at
 all", and with two machines the machine-dependent part cannot be characterised.
 
+### The two machines sit on the diagonal of a 2x2, which is the whole problem
+
+|  | strong memory system | weak memory system |
+|---|---|---|
+| **ARM / NEON** | M1 (have) | **Pi 5** (missing) |
+| **x86 / SSE** | **Ryzen, Zen 5** (missing) | i3-8100T (have) |
+
+Instruction set and memory system are perfectly confounded because only the diagonal is filled. The
+wasm run breaks the confound along one axis only, by holding the machine fixed and changing the
+backend. Either off-diagonal machine breaks it properly; both would complete the design.
+
+**The Ryzen tests something the Pi cannot.** `radixn_extra = 5` is the model's largest single term,
+worth 1.654 -> 1.152 on SSE, and it is justified as an instruction-set property: 16 xmm registers
+against 32 v registers. It is fitted on exactly one x86 machine. Zen 5 also has 16 architectural
+xmm registers, so if the register story is right it should need a similar value there. If it needs
+roughly zero, then "register pressure" was really "Coffee Lake's scheduler", the term is
+machine-specific, and the claim that the expensive part of the model is portable is much weaker.
+Zen 5 also has a strong memory system, so it independently cross-checks the wasm result: if
+MixedRadix versus GoodThomas on Zen 5 behaves like the M1 despite being x86, that confirms the
+preference follows the machine.
+
+**Its noise is not disqualifying for these questions.** The recorded objection to ryzen250 is up to
+2x per-length variation under powersave. That matters for a worst-case regret number, where one bad
+length decides the answer, but the structural questions here are medians over hundreds of pairs.
+Simulating independent per-pair noise on the existing 306 pairs: at 10% the median is determined to
++-0.007, at 20% to +-0.013, at 40% to +-0.028, against an effect of 0.079. And much of the recorded
+variation is slow drift, which the round-robin interleaving cancels within a length because both
+candidates of a ratio are hit equally.
+
+So: run it, report win counts, medians and fitted terms, and **do not quote a worst-case regret
+from it**. Build with `--no-default-features --features sse` as always, and note that governor and
+boost pinning matter far more on a laptop than they did on the ThinkCentre, which has no Turbo.
+
 ### The instrument this needs next is a Pi 5
 
 A Cortex-A76 is NEON with 32 vector registers but a much weaker memory system, so the op counts and
