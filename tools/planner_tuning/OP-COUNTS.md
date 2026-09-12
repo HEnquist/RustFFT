@@ -143,3 +143,23 @@ SSE source was counted rather than scaled:
 
 As on NEON, `src/sse/sse_radixn.rs` wires its cross-FFT layers to these same
 `SseF64ButterflyN::perform_fft_direct` functions, so the table applies to RadixN directly.
+
+## NEON f32
+
+Counted from `perform_parallel_fft_direct`, which is what `src/neon/neon_radixn.rs` wires the
+cross-FFT layers to for f32 and what the `Fft` boilerplate uses for chunk pairs. That function
+computes **two** FFTs at once, so the figures below are the raw count halved, giving a per-FFT cost
+directly comparable with the f64 table.
+
+Primitive differences from f64, read from `impl NeonVector for float32x4_t`: `nmadd` costs 2 rather
+than 1 (`vfmaq_f32` plus `vnegq_f32`) and `mul_complex` costs 6 rather than 4 (`vtrn1q`, `vtrn2q`,
+`vnegq`, `vmulq`, `vrev64q`, `vfmaq`). The f32 rotate helpers in `neon_utils.rs` are `rotate_both`
+at 2, `rotate_hi` at 3, and `rotate_both_45/135/225` at 4.
+
+| len | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 16 | 17 | 19 | 23 | 24 | 29 | 31 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| per FFT | 2 | 4 | 5 | 16 | 11 | 19.5 | 19 | 36 | 37 | 44.5 | 31 | 61.5 | 68 | 66 | 100 | 125.5 | 180 | 113.5 | 279.5 | 321 | 178 |
+
+Per element these are 0.50x to 0.58x the f64 figures, except length 2 at 1.00x, where the packing
+needed by `parallel_fft2_contiguous_f32` eats the whole gain. That near-uniformity is why the table
+turns out not to matter; see the f32 section of `RESULTS.md`.

@@ -1165,6 +1165,7 @@ fn main() {
             "--radixn-extra" => { i += 1; opts.params.radixn_extra = args[i].parse().unwrap(); }
             "--mul-complex" => { i += 1; opts.params.mul_complex = args[i].parse().unwrap(); }
             "--spill" => { i += 1; opts.params.spill = args[i].parse().unwrap(); }
+            "--f64" => opts.params.elem = counted::Elem::F64,
             "--backend" => { i += 1; opts.params.backend = counted::Backend::parse(&args[i]).expect("--backend wants neon or sse"); opts.backend_explicit = true; }
             "--l1-elems" => { i += 1; opts.params.l1_elems = args[i].parse().unwrap(); }
             "--l2-elems" => { i += 1; opts.params.l2_elems = args[i].parse().unwrap(); }
@@ -1210,6 +1211,7 @@ fn main() {
     request_performance_core();
 
     if f32_mode {
+        opts.params.elem = counted::Elem::F32;
         dispatch::<f32>(&planner, &command, &opts, "f32");
     } else {
         dispatch::<f64>(&planner, &command, &opts, "f64");

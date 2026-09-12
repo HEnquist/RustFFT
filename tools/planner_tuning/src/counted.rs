@@ -20,6 +20,24 @@ pub enum Backend {
     Sse,
 }
 
+/// Which element type. One 128-bit vector holds one complex f64 or two complex f32, so this
+/// changes both the instruction counts and how many elements each memory access covers.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Elem {
+    F32,
+    F64,
+}
+
+impl Elem {
+    /// Complex numbers per 128-bit vector.
+    pub fn complex_per_vector(&self) -> f64 {
+        match self {
+            Elem::F32 => 2.0,
+            Elem::F64 => 1.0,
+        }
+    }
+}
+
 impl Backend {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -31,10 +49,14 @@ impl Backend {
 
     /// `NeonVector::mul_complex` is 4 instructions; `SseVector::mul_complex` is 6
     /// (unpacklo, unpackhi, two muls, shuffle, addsub).
-    pub fn mul_complex(&self) -> f64 {
-        match self {
-            Backend::Neon => 4.0,
-            Backend::Sse => 6.0,
+    pub fn mul_complex(&self, elem: Elem) -> f64 {
+        match (self, elem) {
+            // vcombine + vneg + vmulq_laneq + vfmaq_laneq
+            (Backend::Neon, Elem::F64) => 4.0,
+            // vtrn1q + vtrn2q + vnegq + vmulq + vrev64q + vfmaq
+            (Backend::Neon, Elem::F32) => 6.0,
+            // unpacklo + unpackhi + 2 mul + shuffle + addsub
+            (Backend::Sse, _) => 6.0,
         }
     }
 
@@ -59,9 +81,20 @@ impl Backend {
     /// Instructions for one `perform_fft_direct`, excluding the load and store of each element.
     /// Hand-counted from `src/neon/neon_butterflies.rs` and `src/sse/sse_butterflies.rs`; the
     /// derivation is in `OP-COUNTS.md`.
-    pub fn butterfly_compute(&self, len: usize) -> Option<f64> {
+    pub fn butterfly_compute(&self, len: usize, elem: Elem) -> Option<f64> {
         // The generated prime butterflies come out as a closed form, because the generator is a
         // pair of loops. Only the weight of the fmadd chain differs between the backends.
+        // f32 on NEON is counted from `perform_parallel_fft_direct`, which computes two FFTs
+        // at once, and stored here as the per-FFT figure. See OP-COUNTS.md.
+        if let (Backend::Neon, Elem::F32) = (self, elem) {
+            return Some(match len {
+                1 => 0.0, 2 => 2.0, 3 => 4.0, 4 => 5.0, 5 => 16.0, 6 => 11.0, 7 => 19.5,
+                8 => 19.0, 9 => 36.0, 10 => 37.0, 11 => 44.5, 12 => 31.0, 13 => 61.5,
+                15 => 68.0, 16 => 66.0, 17 => 100.0, 19 => 125.5, 23 => 180.0, 24 => 113.5,
+                29 => 279.5, 31 => 321.0, 32 => 178.0,
+                _ => return None,
+            });
+        }
         if matches!(len, 7 | 11 | 13 | 17 | 19 | 23 | 29 | 31) {
             let h = ((len + 1) / 2) as f64;
             return Some(match self {
@@ -164,6 +197,8 @@ pub struct Params {
     pub mul_complex: f64,
     /// Which backend's instruction costs to use.
     pub backend: Backend,
+    /// Which element type.
+    pub elem: Elem,
 }
 
 impl Default for Params {
@@ -180,6 +215,7 @@ impl Default for Params {
             radixn_extra: 0.0,
             mul_complex: -1.0,
             backend: Backend::Neon,
+            elem: Elem::F64,
         }
     }
 }
@@ -198,7 +234,7 @@ impl CountedModel {
         if self.params.mul_complex >= 0.0 {
             self.params.mul_complex
         } else {
-            self.params.backend.mul_complex()
+            self.params.backend.mul_complex(self.params.elem)
         }
     }
 
@@ -206,6 +242,8 @@ impl CountedModel {
     /// given pattern, when the enclosing buffer holds `ws` complex numbers.
     fn mem(&self, accesses: f64, pattern: Pattern, ws: f64) -> f64 {
         let p = &self.params;
+        // One load or store moves a whole vector, which is one complex f64 or two complex f32.
+        let accesses = accesses / p.elem.complex_per_vector();
         let level = if ws <= p.l1_elems {
             0
         } else if ws <= p.l2_elems {
@@ -239,7 +277,7 @@ impl CountedModel {
                 100.0 * n * n
             }
             Spec::Butterfly(len) => {
-                p.backend.butterfly_compute(*len)? + self.mem(2.0 * *len as f64, Pattern::Sequential, ws)
+                p.backend.butterfly_compute(*len, p.elem)? + self.mem(2.0 * *len as f64, Pattern::Sequential, ws)
             }
             Spec::Radix4 { k, base } => {
                 let len = spec.len() as f64;
@@ -249,7 +287,8 @@ impl CountedModel {
                 c += reps * self.cost_ws(base, ws)?;
                 for _ in 0..*k {
                     // len/4 column_butterfly4, each with three twiddle multiplies.
-                    c += (len / 4.0) * (p.backend.column_butterfly4() + 3.0 * self.mul_complex());
+                    c += (len / (4.0 * p.elem.complex_per_vector()))
+                        * (p.backend.column_butterfly4() + 3.0 * self.mul_complex());
                     c += self.mem(2.0 * len, Pattern::Strided, ws);
                 }
                 c
@@ -263,7 +302,7 @@ impl CountedModel {
                     let rf = *r as f64;
                     // The cross-FFT layers call the very same butterfly kernels, so the counted
                     // table applies directly. Row 0 needs no twiddle, hence r - 1.
-                    c += (len / rf) * (p.backend.butterfly_compute(*r)? + (rf - 1.0) * self.mul_complex());
+                    c += (len / rf) * (p.backend.butterfly_compute(*r, p.elem)? + (rf - 1.0) * self.mul_complex());
                     c += self.mem(2.0 * len, Pattern::Strided, ws);
                     c += len * p.radixn_extra;
                     // Register pressure: the layer keeps 2R rows live across the two-column
@@ -286,7 +325,8 @@ impl CountedModel {
                 };
                 // Three transposes, one full twiddle pass, two inner dimensions.
                 let mut c = 3.0 * self.mem(2.0 * len, pat, ws);
-                c += len * self.mul_complex() + self.mem(2.0 * len, Pattern::Sequential, ws);
+                c += (len / p.elem.complex_per_vector()) * self.mul_complex()
+                    + self.mem(2.0 * len, Pattern::Sequential, ws);
                 c += right.len() as f64 * self.cost_ws(left, ws)?;
                 c += left.len() as f64 * self.cost_ws(right, ws)?;
                 c

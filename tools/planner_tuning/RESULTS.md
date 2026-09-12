@@ -550,6 +550,54 @@ This is the strongest argument for the scoped form of the idea over the full est
 two-candidate comparison at one decision point costs almost nothing, while enumerating 48 candidates
 costs this.
 
+## f32 on NEON
+
+The whole spike had been f64. f32 changes real structure: `complex_per_vector` becomes 2, which
+turns on the even-base constraints in `design_radixn`, halves the vector butterfly call count, and
+sends the cross-FFT layers through `perform_parallel_fft_direct`, a different kernel that computes
+two FFTs at once. `verify --f32` passes first, 0 lengths failed at about 1e-7.
+
+| NEON f32, 33-length survey | mean | median | p90 | worst |
+|---|---|---|---|---|
+| counted model | **1.024** | 1.000 | 1.083 | **1.121** |
+| counted model, held-out half | 1.028 | 1.000 | 1.089 | **1.121** |
+| shipping planner | 1.171 | 1.073 | 1.527 | 1.969 |
+
+It clears the bar, and holds out. Note the f32 planner is markedly worse than the f64 one, worst
+1.969 against 1.495, so there is more headroom here than on f64.
+
+It needs its **own weights**: `seq_l2 3.0, strided 2.5, permuted 4.0` against f64's
+`1.5, 1.5, 1.5`. So a weight set is per (machine, element type), not per machine. That is a third
+set, and it is the cost of covering f32.
+
+### The f32-specific op counts bought nothing, and the reason is instructive
+
+The f32 butterflies were counted properly from `perform_parallel_fft_direct` (see `OP-COUNTS.md`).
+Scored with the **f64** table instead, and weights retuned, the result is the same worst case and a
+slightly better mean:
+
+| | best mean | best worst | weights it wants |
+|---|---|---|---|
+| f32 counts | 1.032 | 1.121 | l2 3.0, strided 2.5, permuted 4.0 |
+| f64 counts on f32 data | **1.024** | 1.121 | l2 1.5, strided 1.0, permuted 1.5 |
+
+Both find the same optimum, parameterised differently. The reason is visible in the tables:
+
+| | ratio range | spread | kind of difference |
+|---|---|---|---|
+| f32 against f64 counts | 0.50 to 1.00 | 2.00x | mostly a uniform **scale** |
+| SSE against NEON counts | 1.00 to 1.78 | 1.78x | a change of **shape** |
+
+A uniform scale on the butterfly table cannot change a ranking, because only the balance between
+arithmetic and memory matters and the memory weights absorb it. A change of shape can, which is why
+swapping NEON counts for SSE ones costs 1.043 -> 1.246 while swapping f64 counts for f32 ones costs
+nothing.
+
+**Consequence for a shipping model:** per-element-type op counts are probably not worth maintaining.
+One table per instruction set, plus a weight set per (machine, element type), looks sufficient. The
+f32 counts are kept in `counted.rs` because they are measured and correct, but the evidence says
+they are not earning their maintenance.
+
 ## Caveats
 
 1. **One backend, one float type, one machine.** NEON f64 on an M1. Nothing here shows the weights
