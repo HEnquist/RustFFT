@@ -501,6 +501,55 @@ equally.
 This strengthens the case for dropping the assumed cache sizes from any shipping version: they are
 now shown to be inert across three orders of magnitude of working set, in cache and out.
 
+## Summary across every dataset
+
+Same model, weights fitted per machine, scored against every dump taken.
+
+| dataset | counted model | shipping planner |
+|---|---|---|
+| NEON small, 210-780 | 1.005 / **1.052** | 1.071 / 1.260 |
+| NEON survey, 33 mixed-factor | 1.003 / **1.043** | 1.093 / 1.495 |
+| NEON 15 primes | 1.001 / **1.014** | 1.041 / 1.357 |
+| NEON 10 large, 0.5-2M, out of cache | 1.011 / **1.043** | 1.022 / 1.131 |
+| SSE small, 210-780 | 1.035 / **1.069** | 1.247 / 1.524 |
+| SSE survey, 33 mixed-factor | 1.052 / **1.152** | 1.246 / 1.734 |
+| SSE 15 primes | 1.008 / **1.118** | 1.031 / 1.295 |
+| wasm small, 8 lengths | 1.007 / **1.055** | 1.072 / 1.358 |
+
+(mean / worst). The model wins on both statistics on every dataset. Over the 140 length-backend
+cases: the planner is already optimal at 52 of them, the model is strictly better at 77, strictly
+worse at 13.
+
+The op counts are load-bearing, not decoration: scoring NEON data with SSE's counts degrades
+worst-case from 1.043 to 1.246.
+
+A note on the wasm row. `Backend::parse` knows only `neon` and `sse`, so the wasm dump silently fell
+back to the NEON counts, and it scores better that way (1.055) than with SSE's (1.153) despite wasm
+SIMD having no FMA. That is not luck: V8 compiles wasm SIMD **to NEON machine code** on an M1, so
+the op counts follow the JIT's target, not the bytecode. A shipping version would need to decide
+this deliberately rather than by fallback.
+
+## Plan time, the one axis where the fixed planner is ahead
+
+The fixed planner answers from a few integer operations. Enumerate-and-price has to build the
+candidate set and cost every member.
+
+| len | one FFT | fixed plan | model plan | model plan in FFT executions |
+|---|---|---|---|---|
+| 1260 | 5.3 us | 0.5 us | 178 us | **34x** |
+| 10080 | 47 us | 0.7 us | 354 us | 7.6x |
+| 100800 | 580 us | 0.5 us | 585 us | 1.0x |
+| 1000000 | 9.4 ms | 0.4 us | 556 us | 0.06x |
+
+That is 20x to 1265x the fixed planner's plan time, around 540x on average. In absolute terms it is
+0.02 to 0.6 ms, which is irrelevant for RustFFT's normal plan-once-run-many usage but costs tens of
+executions for a one-shot small transform. The measurement is pessimistic: it builds a fresh planner
+per repetition, so no inner recipe is memoised.
+
+This is the strongest argument for the scoped form of the idea over the full estimating planner: a
+two-candidate comparison at one decision point costs almost nothing, while enumerating 48 candidates
+costs this.
+
 ## Caveats
 
 1. **One backend, one float type, one machine.** NEON f64 on an M1. Nothing here shows the weights

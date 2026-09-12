@@ -856,6 +856,52 @@ fn cmd_costs(path: &str, opts: &Options) {
     }
 }
 
+/// Compare the plan-time cost of the fixed planner against enumerate-and-price.
+///
+/// The fixed planner answers from a few integer operations. A cost model has to enumerate the
+/// candidate set and price every member, which is real work the fixed planner never does. This
+/// is the one axis where the fixed planner is unambiguously ahead, so it should be measured.
+fn cmd_plantime<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
+    let model = counted::CountedModel::new(opts.params);
+    println!(
+        "{:>9} {:>7} {:>14} {:>16} {:>9}",
+        "len", "cands", "planner ns", "enumerate+price", "ratio"
+    );
+    let (mut tot_a, mut tot_b) = (0.0, 0.0);
+    for &len in lengths {
+        // fixed planner: design only, with a fresh planner each time so nothing is cached
+        let reps = 200;
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let mut pl = P::new();
+            std::hint::black_box(pl.plan(len));
+        }
+        let a = t0.elapsed().as_secs_f64() * 1e9 / reps as f64;
+
+        let mut pl = P::new();
+        let n = candidates_capped(&mut pl, len, opts.cap).len();
+        let t1 = Instant::now();
+        for _ in 0..reps {
+            let mut pl = P::new();
+            let specs = candidates_capped(&mut pl, len, opts.cap);
+            let best = specs
+                .iter()
+                .filter_map(|sp| model.cost(sp).map(|c| (c, sp)))
+                .min_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+            std::hint::black_box(best);
+        }
+        let b = t1.elapsed().as_secs_f64() * 1e9 / reps as f64;
+        tot_a += a;
+        tot_b += b;
+        println!(
+            "{:>9} {:>7} {:>14.0} {:>16.0} {:>8.1}x",
+            len, n, a, b, b / a
+        );
+    }
+    println!("\n  total planner {:.0} ns, total enumerate+price {:.0} ns, {:.1}x",
+             tot_a, tot_b, tot_b / tot_a);
+}
+
 fn cmd_model<T: FftNum, P: TunablePlanner<T>>(train: &[usize], test: &[usize], opts: &Options) {
     let max_len = test.iter().chain(train.iter()).copied().max().unwrap_or(1024) * 4;
 
@@ -1009,6 +1055,7 @@ enum Command {
     Score(String),
     Explain(String),
     Costs(String),
+    Plantime(Vec<usize>),
 }
 
 fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
@@ -1027,6 +1074,7 @@ fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
         Command::Score(path) => cmd_score(path, opts),
         Command::Explain(spec) => cmd_explain(spec, opts),
         Command::Costs(path) => cmd_costs(path, opts),
+        Command::Plantime(l) => cmd_plantime::<T, P>(l, opts),
     }
 }
 
@@ -1143,6 +1191,7 @@ fn main() {
         "score" => Command::Score(rest[0].clone()),
         "explain" => Command::Explain(rest[0].clone()),
         "costs" => Command::Costs(rest[0].clone()),
+        "plantime" => Command::Plantime(numbers(&rest)),
         "model" => {
             let lengths = numbers(&rest);
             let split = lengths
