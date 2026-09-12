@@ -11,9 +11,9 @@ Branch `counted_cost_spike`, worktree `/Users/henrik/repos/RustFFT-counted`, bas
 the `tuning` feature.
 
 The verdict is positive: a cost model built by reading source picks within 4.3% of the fastest
-recipe on NEON and 15.2% on SSE, worst case, against a target of "reliably within 20%". It beats
-the shipping planner on mean and worst on all eight datasets, holds on held-out halves, and does
-not degrade when the working set leaves cache.
+recipe on NEON f64, 12.1% on NEON f32 and 15.2% on SSE f64, worst case, against a target of
+"reliably within 20%". It beats the shipping planner on mean and worst on all nine datasets, holds
+on held-out halves, and does not degrade when the working set leaves cache.
 
 Datasets are kept as `dump_*.tsv` (gitignored, regenerate with `dump`). Scoring is pure replay, so
 model iteration needs no machine.
@@ -89,9 +89,10 @@ In rough order of how much each would change the picture.
    plan-time numbers above are the budget it has to fit. Memoising inner recipes across candidates
    is the obvious first optimisation; the measurement deliberately did not do it.
 
-5. **f32.** Everything here is f64. `complex_per_vector` is 2 for f32, which turns on the even-base
-   constraints in `design_radixn` and halves the vector butterfly count, so the op counts and the
-   RadixN base enumeration both change. `radixn_bases()` already filters on it but is untested.
+5. **f32 beyond NEON.** NEON f32 is now done: worst 1.121, mean 1.024, held out, against the
+   planner's 1.969. It needed its own weight set, so weights are per (machine, element type). Still
+   untested: f32 on SSE, which is where the even-base constraints interact with `radix4_bases()`
+   filtering on a multiple of 4, and where `design_radixn`'s f32 base fixup can return None.
 
 ## Things that are settled, do not redo them
 
@@ -104,6 +105,10 @@ In rough order of how much each would change the picture.
   fixes SSE's MR-vs-GT from 38/142 to 104/142 but costs NEON 1.043 -> 1.575. `cross_layer` walks
   `chunks_exact_mut(cross_fft_len)` and every gathered row is inside the current chunk, so a
   cache-resident chunk is touched once whatever the stride.
+- **Per-element-type op counts are not worth maintaining.** The f32 table was counted properly and
+  bought nothing: scored with the f64 table and retuned weights, the worst case is identical and the
+  mean slightly better. f32 differs from f64 by a near-uniform scale, which the memory weights
+  absorb, whereas SSE differs from NEON in shape, which is why that swap does cost 1.043 -> 1.246.
 - **A pure operation count does not work**, confirming FFTW's own verdict locally: mean 1.359,
   worst 1.718, worse than the shipping planner. The memory term is the whole difference.
 - **The MR-vs-GT preference follows the machine, not the backend**: wasm on the M1 tracks NEON on
