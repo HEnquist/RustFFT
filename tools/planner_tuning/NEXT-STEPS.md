@@ -89,10 +89,19 @@ In rough order of how much each would change the picture.
    plan-time numbers above are the budget it has to fit. Memoising inner recipes across candidates
    is the obvious first optimisation; the measurement deliberately did not do it.
 
-5. **f32 beyond NEON.** NEON f32 is now done: worst 1.121, mean 1.024, held out, against the
-   planner's 1.969. It needed its own weight set, so weights are per (machine, element type). Still
-   untested: f32 on SSE, which is where the even-base constraints interact with `radix4_bases()`
-   filtering on a multiple of 4, and where `design_radixn`'s f32 base fixup can return None.
+5. ~~**f32 beyond NEON.**~~ **Done, 2026-09-15.** SSE f32 measures worst 1.121, mean 1.031, held
+   out at 1.105, against the planner's 1.927. All four cells of {NEON, SSE} x {f32, f64} now clear
+   the bar. The feared interaction (even-base constraints against `radix4_bases()` filtering on a
+   multiple of 4, and `design_radixn`'s f32 base fixup returning None) did not materialise:
+   candidate counts track the NEON f32 run and `verify` is clean at every length.
+
+   It threw off one finding worth having. With four datasets on one grid, `permuted` splits by
+   element type rather than by backend, 1.5 at f64 and 4.0 to 6.0 at f32, which identified a
+   missing term: `mem()` divided permuted accesses by `complex_per_vector`, but a gather or scatter
+   computes an address per element and cannot fill a vector. Charging them per element,
+   now the default, leaves both f64 datasets byte-identical, moves both f32 optima to 2.5, and
+   takes SSE f32 from 51 to 117 of 216 grid points clearing 20%. Weights are still per (machine,
+   element type); the correction buys robustness, not a smaller table. See `RESULTS.md`.
 
 ## Things that are settled, do not redo them
 
@@ -118,6 +127,10 @@ In rough order of how much each would change the picture.
   the scatter stride). The mechanism is still unknown.
 
 ## Operational notes
+
+- `verify`'s reference DFT now runs in f64 whatever the recipes use, and its threshold is a
+  length-scaled budget rather than a flat `1e-6`. The old same-precision reference produced false
+  failures at f32 above len 10000, where the naive DFT is less accurate than the FFTs it judges.
 
 - `dump` measures once, `score` and `costs` replay offline, `explain` prints a recipe's cost tree,
   `plantime` compares planning cost. `sweep.sh` grids the weights.

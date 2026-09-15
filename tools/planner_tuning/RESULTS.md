@@ -1,8 +1,9 @@
 # Counted-op cost model: experiment result
 
-**Verdict: the idea works, on two architectures, and clears the bar on both.** A cost model built
-entirely from reading the source picks a recipe within **4.3% of the fastest in the worst case on
-NEON** and **15.2% on SSE**, against a target of "reliably within 20%, 10% would be amazing". Both
+**Verdict: the idea works, on two architectures and both element types, and clears the bar on all
+four.** A cost model built entirely from reading the source picks a recipe within **4.3% of the
+fastest in the worst case on NEON f64** and **15.2% on SSE f64**, against a target of "reliably
+within 20%, 10% would be amazing". f32 comes in at **12.1% on NEON** and **12.1% on SSE**. All four
 results hold on a held-out half of the lengths.
 
 The op counts are read per backend, as expected for different instruction sets. Beyond that, three
@@ -503,7 +504,8 @@ now shown to be inert across three orders of magnitude of working set, in cache 
 
 ## Summary across every dataset
 
-Same model, weights fitted per machine, scored against every dump taken.
+Same model, weights fitted per (machine, element type), scored against every dump taken. All rows
+are f64 unless the row says f32.
 
 | dataset | counted model | shipping planner |
 |---|---|---|
@@ -511,14 +513,16 @@ Same model, weights fitted per machine, scored against every dump taken.
 | NEON survey, 33 mixed-factor | 1.003 / **1.043** | 1.093 / 1.495 |
 | NEON 15 primes | 1.001 / **1.014** | 1.041 / 1.357 |
 | NEON 10 large, 0.5-2M, out of cache | 1.011 / **1.043** | 1.022 / 1.131 |
+| NEON survey, **f32** | 1.032 / **1.121** | 1.171 / 1.969 |
 | SSE small, 210-780 | 1.035 / **1.069** | 1.247 / 1.524 |
 | SSE survey, 33 mixed-factor | 1.052 / **1.152** | 1.246 / 1.734 |
 | SSE 15 primes | 1.008 / **1.118** | 1.031 / 1.295 |
+| SSE survey, **f32** | 1.031 / **1.121** | 1.207 / 1.927 |
 | wasm small, 8 lengths | 1.007 / **1.055** | 1.072 / 1.358 |
 
 (mean / worst). The model wins on both statistics on every dataset. Over the 140 length-backend
-cases: the planner is already optimal at 52 of them, the model is strictly better at 77, strictly
-worse at 13.
+cases in the f64 rows: the planner is already optimal at 52 of them, the model is strictly better
+at 77, strictly worse at 13.
 
 The op counts are load-bearing, not decoration: scoring NEON data with SSE's counts degrades
 worst-case from 1.043 to 1.246.
@@ -598,11 +602,111 @@ One table per instruction set, plus a weight set per (machine, element type), lo
 f32 counts are kept in `counted.rs` because they are measured and correct, but the evidence says
 they are not earning their maintenance.
 
+## f32 on SSE, and the term that four datasets exposed
+
+Measured on the ThinkCentre, 2026-09-15, same 33 lengths, `--rounds 7 --cap 48`. This was the last
+untested cell of the {NEON, SSE} x {f32, f64} grid, and the one flagged in `NEXT-STEPS.md` as risky:
+it is where `design_radixn`'s even-base constraints meet `radix4_bases()` filtering on a multiple of
+4, and where the f32 base fixup can return None. None of that broke. Candidate counts match the
+NEON f32 run closely, and `verify --planner sse --f32` is clean at every length.
+
+| SSE f32, 33-length survey | mean | median | p90 | worst |
+|---|---|---|---|---|
+| counted model | **1.031** | 1.002 | 1.105 | **1.121** |
+| counted model, held-out half | 1.028 | 1.000 | 1.086 | **1.105** |
+| shipping planner | 1.207 | 1.152 | 1.490 | 1.927 |
+
+Four for four, then: every backend and element type tested clears the 20% bar, and every one holds
+out. As on NEON, the f32 planner is the weaker one, worst 1.927 against f64's 1.734, so f32 is where
+the headroom is on both architectures.
+
+It needs its own weights, as f32 did on NEON. The SSE **f64** weights score 1.174 mean and 1.870
+worst on f32, barely ahead of the planner, and every visible miss is a `gt(...)`.
+
+### The four best weight sets, on one identical grid
+
+Re-gridding all four datasets over the same 216 points, rather than comparing the numbers each was
+originally fitted on, makes a pattern visible that three datasets could not show:
+
+| dataset | l2 | strided | permuted | radixn_extra | mean | worst |
+|---|---|---|---|---|---|---|
+| NEON f64 | any | 1.5 | **1.5** | 0 | 1.003 | 1.043 |
+| NEON f32 | 3.0 | 2.5 | **4.0** | 0 | 1.032 | 1.121 |
+| SSE f64 | 2.0 | 2.5 | **1.5** | 5 | 1.052 | 1.152 |
+| SSE f32 | 1.5 | 2.5 | **6.0** | 3 | 1.034 | 1.121 |
+
+`permuted` splits by element type, not by backend: 1.5 for both f64 sets, 4.0 to 6.0 for both f32
+sets. A weight that tracks the element type across two unrelated instruction sets is not a fitting
+artefact, it is a missing term. That is the same diagnostic that found the Rader's index chain and
+`radixn_extra`.
+
+### The mechanism, and the fix
+
+`mem()` divided every access count by `complex_per_vector`, on the reasoning that one load moves a
+whole vector. That is true of a sequential or strided pass and false of a permuted one. Digit
+reversal, Good-Thomas CRT reindexing and Rader's permutation all compute a destination per element,
+so there is no contiguous run to fill a vector with. The model was therefore under-charging permuted
+traffic by exactly `complex_per_vector`: a factor of 1 at f64, where it is invisible, and a factor
+of 2 at f32, where the fitted weight had to absorb it.
+
+Charging permuted passes per complex number instead, which is now the default
+(`--permuted-vector` restores the old behaviour):
+
+| dataset | permuted before | after | worst before | after | grid points clearing 20% |
+|---|---|---|---|---|---|
+| NEON f64 | 1.5 | 1.5 | 1.0427 | 1.0427 | 95/216 -> 95/216 |
+| NEON f32 | 4.0 | **2.5** | 1.1213 | 1.1213 | 4/216 -> 3/216 |
+| SSE f64 | 1.5 | 1.5 | 1.1515 | 1.1515 | 2/216 -> 2/216 |
+| SSE f32 | 6.0 | **2.5** | 1.1210 | 1.1210 | 51/216 -> **117/216** |
+
+Three things to note.
+
+1. **Both f64 datasets are byte-identical**, which they must be, because the factor is 1 there. A
+   change that moved them would have been a fudge rather than a correction.
+2. **Both f32 datasets move their optimum to the same value, 2.5**, from 4.0 and 6.0 respectively,
+   and neither loses any accuracy doing it.
+3. **SSE f32 becomes far less weight-sensitive**, from 51 of 216 settings clearing the bar to 117.
+   That is the practical payoff: the model stops depending on hitting one weight precisely.
+
+Cross-type transfer improves sharply too, though it does not close: applying each machine's f64
+weights to its f32 data goes from 2.427 to 1.770 worst on NEON, and from 1.870 to 1.509 on SSE.
+
+### What this does not do
+
+It does not collapse the weight sets. f32 still wants `permuted 2.5` where f64 wants 1.5, and one
+shared set across all four datasets (l2 2.0, strided 2.5, permuted 2.5) gives worst cases of 1.167,
+1.324, 1.323 and 1.198, so three of the four miss the bar. **Weights remain per (machine, element
+type).** The correction buys a better parameterisation and much more robustness, not a smaller
+table.
+
+`radixn_extra` also shrinks with the element type, 5 at f64 against 2 to 3 at f32 on the same
+machine and the same backend. That is the direction the register-pressure story predicts: the
+penalty is charged per complex element, a spilled xmm register holds two complex f32, so the same
+count of spilled vectors amortises over twice the elements. Predicted 2.5, observed 2 to 3. It stays
+0 on NEON at both element types.
+
+### The verify gate was wrong for f32, and is now fixed
+
+`verify` compared against a direct DFT computed in the **same** precision as the recipes under test.
+A naive DFT sums `len` terms per output, so its own error grows with length, and at f32 it swamps
+what is being measured: at len 100000 the f32 reference is off by 1.6e-5 while the recipes it judges
+are off by 1.6e-7. Against a flat `1e-6` threshold that produced false failures, first seen as
+`10125 FAIL 1.860e-6` on SSE f32. The **scalar** planner, which shares no SIMD code, failed the same
+lengths by the same margins, which is what identified the reference rather than the kernels.
+
+The reference is now computed in f64 whatever the recipes use, and the threshold is a budget of two
+terms: `20 * eps * sqrt(log2 len)` for the recipe, whose error accumulates over passes, plus
+`4 * eps_f64 * sqrt(len)` for the reference, whose error accumulates over elements. With an f64
+reference, f32 recipe error comes out flat at 1.3e-7 to 1.6e-7 at every length from 1000 to 100000,
+which is `eps_f32` and is the right answer. The same fix removed a false f64 failure at 100000,
+where the f64 reference had the identical problem hidden by the loose threshold.
+
 ## Caveats
 
-1. **One backend, one float type, one machine.** NEON f64 on an M1. Nothing here shows the weights
-   transfer to SSE on a different microarchitecture, which is the claim the whole idea rests on.
-   The cheap next test is one `dump` on the thinkcentre and one offline refit.
+1. **Two machines, and they are confounded.** All four cells of {NEON, SSE} x {f32, f64} now clear
+   the bar and hold out, so the idea travels across instruction sets and element types. But the two
+   machines sit on the diagonal of {ARM, x86} x {strong, weak memory}, so instruction set and memory
+   system cannot be told apart. A third machine is the instrument this needs; see `NEXT-STEPS.md`.
 2. **33 adversarial lengths.** They are mixed-factor composites near round numbers, chosen because
    that is where a planner is weakest. Powers of two come out 1.000 for everyone.
 3. **Regret is a lower bound.** Candidate inner recipes come from the same planner, so the true
@@ -612,6 +716,8 @@ they are not earning their maintenance.
    re-derived. That is inherent to a model read from source: it is accurate because it tracks the
    code, and it must be updated when the code changes.
 5. **`--cap 48`** trims the candidate list at lengths with hundreds of divisors.
+6. **Weights are per (machine, element type).** Four sets for two machines. The `permuted_scalar`
+   correction narrowed the f32-to-f64 gap but did not close it, and no single set covers all four.
 
 ## Reproducing
 
@@ -623,7 +729,22 @@ cd tools/planner_tuning && cargo build --release
     --rader-index 50 dump_neon_f64.tsv
 ./target/release/planner_tuning explain 'rad(rn(7.6,rad(rn(7.5.4,b17))))'   # cost tree, to check recursion
 ./sweep.sh dump_neon_f64.tsv                                               # the 108-point grid
+./grid.sh dump_sse_f32.tsv --f32                                           # the 216-point grid
+python3 split.py dump_sse_f32.tsv sse_f32_train.tsv sse_f32_test.tsv       # the held-out halves
 ```
+
+SSE f32, measured on the thinkcentre, then scored anywhere:
+
+```sh
+./target/release/planner_tuning verify --planner sse --f32 --cap 48 <lengths>
+./target/release/planner_tuning dump --planner sse --f32 --rounds 7 --cap 48 \
+    --out dump_sse_f32.tsv <the 33 lengths>
+./target/release/planner_tuning score --f32 --seq-l1 1.0 --seq-l2 1.5 --seq-dram 6.0 \
+    --strided 2.5 --permuted 2.5 --rader-index 50 --radixn-extra 2 dump_sse_f32.tsv
+```
+
+`--f32` is needed on `score` as well as on `dump`: the dump header records the planner, so the
+backend is recovered automatically, but it does not record the element type.
 
 `dump` measures once and writes every candidate's time; `score` and `sweep.sh` are pure replay, so
 model iteration after the first run needs no machine at all. That is the part that makes this

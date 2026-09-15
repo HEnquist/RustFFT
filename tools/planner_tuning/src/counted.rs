@@ -195,6 +195,19 @@ pub struct Params {
     /// instruction count suggests: three of its six instructions are shuffle-class, and on Intel
     /// those all issue to a single port, whereas NEON spreads them over symmetric pipes.
     pub mul_complex: f64,
+    /// Charge permuted passes per complex number rather than per vector. On by default.
+    ///
+    /// A gather or scatter moves one complex number at a time: digit reversal, CRT reindexing and
+    /// Rader's permutation all compute a destination per element, so there is no contiguous run to
+    /// fill a vector with. Dividing their access count by `complex_per_vector` therefore
+    /// under-charges them by exactly that factor, which is invisible at f64 (where the factor is
+    /// 1) and a factor of 2 at f32.
+    ///
+    /// Setting this false restores the original behaviour, which is what `--permuted-vector` is
+    /// for. That costs nothing at f64, where both f64 datasets score byte-identically either way,
+    /// and at f32 it forces the fitted `permuted_mult` up from 2.5 to between 4.0 and 6.0 to
+    /// absorb the same factor. See the f32-on-SSE section of `RESULTS.md`.
+    pub permuted_scalar: bool,
     /// Which backend's instruction costs to use.
     pub backend: Backend,
     /// Which element type.
@@ -214,6 +227,7 @@ impl Default for Params {
             spill: 0.0,
             radixn_extra: 0.0,
             mul_complex: -1.0,
+            permuted_scalar: true,
             backend: Backend::Neon,
             elem: Elem::F64,
         }
@@ -242,8 +256,13 @@ impl CountedModel {
     /// given pattern, when the enclosing buffer holds `ws` complex numbers.
     fn mem(&self, accesses: f64, pattern: Pattern, ws: f64) -> f64 {
         let p = &self.params;
-        // One load or store moves a whole vector, which is one complex f64 or two complex f32.
-        let accesses = accesses / p.elem.complex_per_vector();
+        // One load or store moves a whole vector, which is one complex f64 or two complex f32,
+        // except under a permutation, where each element's address is computed separately.
+        let per_access = match (pattern, p.permuted_scalar) {
+            (Pattern::Permuted, true) => 1.0,
+            _ => p.elem.complex_per_vector(),
+        };
+        let accesses = accesses / per_access;
         let level = if ws <= p.l1_elems {
             0
         } else if ws <= p.l2_elems {

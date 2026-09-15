@@ -421,6 +421,29 @@ fn cmd_regret<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options
 ///
 /// Timing a recipe says nothing about whether it is valid, and an invalid one would happily
 /// produce fast wrong answers. Each candidate is compared against a direct DFT.
+/// Error budget for a correct FFT of this length in this precision.
+///
+/// Two terms, because two things are inexact.
+///
+/// The recipe's own error grows like `eps * sqrt(log2 len)`: an FFT accumulates rounding over its
+/// `log2 len` passes, not over its elements. The margin of 20 leaves room for recipes that compose
+/// several algorithms, and still catches a real defect, which shows up as orders of magnitude
+/// rather than as a factor of two.
+///
+/// The reference's error grows like `eps * sqrt(len)`, because a naive DFT really does sum `len`
+/// terms per output. The reference runs in f64, so for f32 recipes this term is negligible and the
+/// budget is tight. For f64 recipes the reference is no better than the thing it judges, and this
+/// term dominates: at len 100000 it is 2.8e-13 against the recipes' 1.8e-14.
+fn tolerance<T: FftNum>(len: usize) -> f64 {
+    let eps = if std::mem::size_of::<T>() == 4 {
+        f32::EPSILON as f64
+    } else {
+        f64::EPSILON
+    };
+    let len = len as f64;
+    20.0 * eps * len.log2().max(1.0).sqrt() + 4.0 * f64::EPSILON * len.sqrt()
+}
+
 fn cmd_verify<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
     let mut worst_overall: f64 = 0.0;
     let mut failures = 0usize;
@@ -435,15 +458,19 @@ fn cmd_verify<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(lengths: &[usize], 
             .collect();
 
         // Reference: a direct DFT, which shares no code with the recipes under test.
-        let reference_fft = rustfft::algorithm::Dft::<T>::new(len, FftDirection::Forward);
-        let mut reference = input.clone();
+        //
+        // It is computed in f64 even when the recipes run in f32. A same-precision reference is
+        // useless at large f32 lengths: the naive DFT sums `len` terms, so its own error grows
+        // with length and swamps what is being measured. At len 100000 an f32 reference DFT is
+        // off by 1.6e-5, which is 30x the error of the recipes it is judging.
+        let reference_fft = rustfft::algorithm::Dft::<f64>::new(len, FftDirection::Forward);
+        let mut reference: Vec<Complex<f64>> = input
+            .iter()
+            .map(|c| Complex::new(c.re.to_f64().unwrap(), c.im.to_f64().unwrap()))
+            .collect();
         let mut reference_scratch = vec![Complex::zero(); reference_fft.get_inplace_scratch_len()];
         reference_fft.process_with_scratch(&mut reference, &mut reference_scratch);
-        let reference_norm: f64 = reference
-            .iter()
-            .map(|c| c.norm_sqr().to_f64().unwrap())
-            .sum::<f64>()
-            .sqrt();
+        let reference_norm: f64 = reference.iter().map(|c| c.norm_sqr()).sum::<f64>().sqrt();
 
         let mut planner = P::new();
         let specs = candidates_capped(&mut planner, len, opts.cap);
@@ -459,7 +486,13 @@ fn cmd_verify<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(lengths: &[usize], 
             let error: f64 = buffer
                 .iter()
                 .zip(reference.iter())
-                .map(|(a, b)| (a - b).norm_sqr().to_f64().unwrap())
+                .map(|(a, b)| {
+                    let d = Complex::new(
+                        a.re.to_f64().unwrap() - b.re,
+                        a.im.to_f64().unwrap() - b.im,
+                    );
+                    d.norm_sqr()
+                })
                 .sum::<f64>()
                 .sqrt()
                 / reference_norm;
@@ -469,15 +502,16 @@ fn cmd_verify<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(lengths: &[usize], 
             }
         }
 
-        let bad = worst_here > 1e-6;
+        let bad = worst_here > tolerance::<T>(len);
         if bad {
             failures += 1;
         }
         println!(
-            "{:>8}  {} candidates, worst relative error {:.3e}  {}{}",
+            "{:>8}  {} candidates, worst relative error {:.3e} (budget {:.1e})  {}{}",
             len,
             specs.len(),
             worst_here,
+            tolerance::<T>(len),
             if bad { "FAIL " } else { "" },
             worst_spec
         );
@@ -1111,6 +1145,7 @@ fn main() {
         eprintln!("  --block-ms MS   wall-clock time per timed block (default 10)");
         eprintln!("  --cap N         max candidates per length (default 48)");
         eprintln!("  --f32           measure f32 instead of f64");
+        eprintln!("  --permuted-vector  charge permuted passes per vector, not per element");
         eprintln!("  --bucketed      fit overhead curves over working set, not constants");
         eprintln!("  --verbose       for 'regret', list the top candidates per length");
         std::process::exit(2);
@@ -1165,6 +1200,7 @@ fn main() {
             "--radixn-extra" => { i += 1; opts.params.radixn_extra = args[i].parse().unwrap(); }
             "--mul-complex" => { i += 1; opts.params.mul_complex = args[i].parse().unwrap(); }
             "--spill" => { i += 1; opts.params.spill = args[i].parse().unwrap(); }
+            "--permuted-vector" => opts.params.permuted_scalar = false,
             "--f64" => opts.params.elem = counted::Elem::F64,
             "--backend" => { i += 1; opts.params.backend = counted::Backend::parse(&args[i]).expect("--backend wants neon or sse"); opts.backend_explicit = true; }
             "--l1-elems" => { i += 1; opts.params.l1_elems = args[i].parse().unwrap(); }
