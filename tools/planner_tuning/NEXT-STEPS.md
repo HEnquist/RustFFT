@@ -4,6 +4,80 @@ Written 2026-09-11, at the end of the spike that produced `RESULTS.md`. That doc
 evidence; this one is the plan. Read `RESULTS.md` first for numbers, and `OP-COUNTS.md` for how the
 instruction counts were derived.
 
+## Update, 2026-09-15: the crossover term, and a bigger dataset
+
+Nothing below this section is retracted, but two numbers in `RESULTS.md` are stale and one
+structural weakness in the dataset has been fixed.
+
+**`RESULTS.md`'s headline is stale on this branch.** It records NEON f64 at mean 1.0027, worst
+1.0427. Scoring the same `dump_neon_f64.tsv` with the unmodified model on `simd_radixn_split`
+(9ce0980) gives **1.0125 / 1.1669**. The RadixN work moved it underneath the document. Re-measure
+before quoting any figure from `RESULTS.md`.
+
+**A sweep over every length 1..1000 found a defect the 33 length set could not see.** Timing the
+planner's pick against the model's pick at all 1000 lengths showed the model losing systematically
+wherever a `Small` variant was available: 127 lengths at a geometric mean of 0.945 in f64, 214 at
+0.930 in f32. The cause is structural: **every one of the original 33 lengths is 1000 or larger**,
+and the `Small` variants need two butterfly inners, so they stop being candidates near 1024. The
+set was blind to the whole class.
+
+**The mechanism is a crossover, not a sign error.** `MixedRadixSmall` and
+`GoodThomasAlgorithmSmall` transpose with `array_utils::transpose_small`, whose read index strides
+by `width` and so touches a fresh 64 byte line per 16 byte element. The general forms call the
+`transpose` crate, which tiles to recover that reuse and pays per row setup for it. Dearer per row,
+cheaper per element. Measured general over small on the M1:
+
+```text
+len        22     28     45    104    496    992
+gt/gts   1.341  1.270  1.182  1.056  1.001  1.027
+mr/mrs   1.115  1.059  1.048  1.013  0.931  0.948
+```
+
+The decay towards 1, and MixedRadix crossing under it near len 200, is a fixed cost amortising. A
+per element difference could produce neither shape. Two wrong turns are worth not repeating: making
+the general transpose `Sequential` lets `mr(b32,b32)` win at 1024 (regret 1.167), and charging both
+variants the same pattern lets `mrs(b32,b32)` win there instead (1.290). The original `Permuted`
+charge on the small variants was load-bearing, just misexplained; leave it alone.
+
+**The fix is one weight.** `Params::general_row`, default 30, charged per row to the general
+variants only, with rows taken as `1.5 * (width + height)`. All twelve pairs above are called
+correctly for any value in 21 to 42, bounded by Good-Thomas at 992 below and MixedRadix at 496
+above. Over the full 1..1000 sweep it takes f64 from 129 losses beyond 2% to 26, and f32 from 216
+to 93.
+
+**The dataset is now 44 lengths.** Added 22, 45, 59, 104, 120, 233, 320, 373, 496, 720, 992, dumped
+with the original settings (`--rounds 7 --block-ms 10 --cap 48`) and appended to
+`dump_neon_f64.tsv` and `dump_neon_f32.tsv`. `verify` is clean at all eleven. The train/test splits
+were regenerated, so they are 22/22 now and any figure quoted against the old 17/16 split is stale.
+Scores on the extended set, f64:
+
+| | mean | p90 | worst |
+|---|---|---|---|
+| shipping planner | 1.0853 | 1.2605 | 1.4945 |
+| model, `general_row` 0 | 1.0322 | 1.1268 | 1.3761 |
+| model, `general_row` 30 | **1.0207** | **1.0582** | **1.2747** |
+
+Held out: train 1.0405 -> 1.0269, test 1.0238 -> 1.0146. The f32 numbers in the session were run
+with the f64 weights, so they show the direction but are not the f32 result; retune before quoting.
+
+**What the extended set now exposes, in priority order.**
+
+1. **Rader's versus Bluestein's is the worst remaining defect**, and it is the same decision as
+   Track A below, arriving from the other side. The model takes `rad(...)` where the planner's
+   `bs(...)` is faster: len 59 at 1.275, 233 at 1.146, 373 at 1.127 in f64, and up to 1.6x in f32.
+   Note the model is *worse than the planner* at these three, which is new.
+2. **The width/height asymmetry is now measurable.** The model ties `mr(A,B)` with `mr(B,A)`, so it
+   picks between them arbitrarily, and four of the new lengths land on the wrong one: 22 picks
+   `gts(b11,b2)` for 1.058, 104 `gts(b13,b8)` for 1.019, 992 `gts(b31,b32)` for 1.041. That is
+   item 2 under Track B, and it was not scoreable before.
+3. Lengths 120 and 320 are large shipping-planner failures (1.387 and 1.222) that the model gets
+   right, so they are useful regression guards.
+
+**Uncommitted state in this worktree.** `counted.rs` (the `general_row` term) and `main.rs` (its
+`--general-row` flag) are the real change. `main.rs` also carries a throwaway `sweep` subcommand
+used only for the 1..1000 comparison and its artifact; **it is not to be committed**, so drop those
+hunks before committing anything else from `main.rs`. The dump and split files are regenerated data.
+
 ## State of the work
 
 Branch `counted_cost_spike`, worktree `/Users/henrik/repos/RustFFT-counted`, based on

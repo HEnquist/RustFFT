@@ -208,6 +208,35 @@ pub struct Params {
     /// and at f32 it forces the fitted `permuted_mult` up from 2.5 to between 4.0 and 6.0 to
     /// absorb the same factor. See the f32-on-SSE section of `RESULTS.md`.
     pub permuted_scalar: bool,
+    /// Fixed cost per row of a pass, charged to the **general** MixedRadix and GoodThomas
+    /// variants and not to their `Small` counterparts.
+    ///
+    /// The two pairs move the same data in the same order; they differ in implementation.
+    /// `MixedRadixSmall` and `GoodThomasAlgorithmSmall` call `array_utils::transpose_small`,
+    /// a naive strided double loop over the whole rectangle, and read their permutation from a
+    /// precomputed table. `MixedRadix` and `GoodThomasAlgorithm` call the `transpose` crate's
+    /// blocked transpose, which keeps both streams cache resident, and `GoodThomasAlgorithm`
+    /// additionally computes the CRT mapping on the fly with one `StrengthReducedUsize::div_rem`
+    /// and a branch per row rather than per element.
+    ///
+    /// The general form is therefore cheaper per element and dearer per row, which is a
+    /// crossover, and the measurements are the shape of one. General over small on the M1:
+    ///
+    /// ```text
+    /// len        22     28     45    104    496    992
+    /// gt/gts   1.341  1.270  1.182  1.056  1.001  1.027
+    /// mr/mrs   1.115  1.059  1.048  1.013  0.931  0.948
+    /// ```
+    ///
+    /// The advantage decays towards 1 and MixedRadix crosses under it near len 200. A per-element
+    /// difference alone could produce neither: it would hold roughly constant in ratio, and it
+    /// could never change sign. Without this term the model has only per-element costs, so it
+    /// prices the pair by pattern alone and picks the general form at every length.
+    ///
+    /// Every one of the twelve pairs above is called correctly for `general_row` anywhere in
+    /// 21 to 42; the binding constraints are Good-Thomas at 992 below and MixedRadix at 496
+    /// above. 30 sits in the middle of that window.
+    pub general_row: f64,
     /// Which backend's instruction costs to use.
     pub backend: Backend,
     /// Which element type.
@@ -228,6 +257,7 @@ impl Default for Params {
             radixn_extra: 0.0,
             mul_complex: -1.0,
             permuted_scalar: true,
+            general_row: 30.0,
             backend: Backend::Neon,
             elem: Elem::F64,
         }
@@ -254,6 +284,15 @@ impl CountedModel {
 
     /// Cost of touching `accesses` elements (counting each load and each store once) with the
     /// given pattern, when the enclosing buffer holds `ws` complex numbers.
+    /// Rows walked by the three passes of a width x height decomposition.
+    ///
+    /// The passes run over `height`, `width` and `height` rows respectively, so the exact total is
+    /// `2h + w`. The model deliberately ties `mr(A,B)` with `mr(B,A)`, so use the mean of the two
+    /// orderings, `1.5 * (w + h)`, rather than introduce an asymmetry here alone.
+    fn rows(&self, left: &Spec, right: &Spec) -> f64 {
+        1.5 * (left.len() as f64 + right.len() as f64)
+    }
+
     fn mem(&self, accesses: f64, pattern: Pattern, ws: f64) -> f64 {
         let p = &self.params;
         // One load or store moves a whole vector, which is one complex f64 or two complex f32,
@@ -337,13 +376,19 @@ impl CountedModel {
             }
             Spec::MixedRadix { left, right, small } => {
                 let len = spec.len() as f64;
-                let pat = if *small {
-                    Pattern::Permuted
-                } else {
-                    Pattern::Strided
-                };
                 // Three transposes, one full twiddle pass, two inner dimensions.
+                //
+                // Both variants transpose the same rectangle three times, but not the same way.
+                // `MixedRadixSmall` calls `transpose_small`, whose read index strides by `width`
+                // and so touches a fresh cache line per element once `width` exceeds a line:
+                // line-wasting, which is what `Permuted` prices. `MixedRadix` hands the job to
+                // the `transpose` crate, which tiles the rectangle to get that reuse back, and
+                // pays `general_row` per row of setup for it.
+                let pat = if *small { Pattern::Permuted } else { Pattern::Strided };
                 let mut c = 3.0 * self.mem(2.0 * len, pat, ws);
+                if !*small {
+                    c += p.general_row * self.rows(left, right);
+                }
                 c += (len / p.elem.complex_per_vector()) * self.mul_complex()
                     + self.mem(2.0 * len, Pattern::Sequential, ws);
                 c += right.len() as f64 * self.cost_ws(left, ws)?;
@@ -352,15 +397,20 @@ impl CountedModel {
             }
             Spec::GoodThomas { left, right, small } => {
                 let len = spec.len() as f64;
-                let pat = if *small {
-                    Pattern::Permuted
-                } else {
-                    Pattern::Strided
-                };
                 // Two CRT reindexing passes and one transpose, but no twiddle multiplies at all:
                 // dropping them is the whole point of Good-Thomas, and it pays in index work.
+                //
+                // Both reindexing passes are `Permuted` in either variant. The small one gathers
+                // through a precomputed table; the general one walks `destination_index` forward
+                // by `width + 1` and wraps modulo `len`, which cycles over the whole buffer and
+                // is no friendlier to a cache than a table would be. The transpose splits the two
+                // exactly as in MixedRadix, and the general form pays the same per-row setup.
+                let pat = if *small { Pattern::Permuted } else { Pattern::Strided };
                 let mut c = 2.0 * self.mem(2.0 * len, Pattern::Permuted, ws);
                 c += self.mem(2.0 * len, pat, ws);
+                if !*small {
+                    c += p.general_row * self.rows(left, right);
+                }
                 c += right.len() as f64 * self.cost_ws(left, ws)?;
                 c += left.len() as f64 * self.cost_ws(right, ws)?;
                 c

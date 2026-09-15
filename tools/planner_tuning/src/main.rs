@@ -1200,6 +1200,7 @@ fn main() {
             "--radixn-extra" => { i += 1; opts.params.radixn_extra = args[i].parse().unwrap(); }
             "--mul-complex" => { i += 1; opts.params.mul_complex = args[i].parse().unwrap(); }
             "--spill" => { i += 1; opts.params.spill = args[i].parse().unwrap(); }
+            "--general-row" => { i += 1; opts.params.general_row = args[i].parse().unwrap(); }
             "--permuted-vector" => opts.params.permuted_scalar = false,
             "--f64" => opts.params.elem = counted::Elem::F64,
             "--backend" => { i += 1; opts.params.backend = counted::Backend::parse(&args[i]).expect("--backend wants neon or sse"); opts.backend_explicit = true; }
