@@ -62,21 +62,87 @@ with the f64 weights, so they show the direction but are not the f32 result; ret
 
 **What the extended set now exposes, in priority order.**
 
-1. **Rader's versus Bluestein's is the worst remaining defect**, and it is the same decision as
-   Track A below, arriving from the other side. The model takes `rad(...)` where the planner's
-   `bs(...)` is faster: len 59 at 1.275, 233 at 1.146, 373 at 1.127 in f64, and up to 1.6x in f32.
-   Note the model is *worse than the planner* at these three, which is new.
-2. **The width/height asymmetry is now measurable.** The model ties `mr(A,B)` with `mr(B,A)`, so it
-   picks between them arbitrarily, and four of the new lengths land on the wrong one: 22 picks
-   `gts(b11,b2)` for 1.058, 104 `gts(b13,b8)` for 1.019, 992 `gts(b31,b32)` for 1.041. That is
-   item 2 under Track B, and it was not scoreable before.
+1. ~~**Rader's versus Bluestein's is the worst remaining defect.**~~ **Fixed, 2026-09-15. See the
+   next section.**
+2. **The width/height asymmetry is now the worst remaining defect.** The model ties `mr(A,B)`
+   with `mr(B,A)`, so it picks between them arbitrarily, and four of the new lengths land on the
+   wrong one: 22 picks `gts(b11,b2)` for 1.058, 104 `gts(b13,b8)` for 1.019, 992 `gts(b31,b32)`
+   for 1.041. That is item 2 under Track B, and it was not scoreable before.
 3. Lengths 120 and 320 are large shipping-planner failures (1.387 and 1.222) that the model gets
    right, so they are useful regression guards.
 
-**Uncommitted state in this worktree.** `counted.rs` (the `general_row` term) and `main.rs` (its
-`--general-row` flag) are the real change. `main.rs` also carries a throwaway `sweep` subcommand
-used only for the 1..1000 comparison and its artifact; **it is not to be committed**, so drop those
-hunks before committing anything else from `main.rs`. The dump and split files are regenerated data.
+## Update, 2026-09-15: Rader's versus Bluestein's, resolved by one weight
+
+Item 1 above is fixed, and it was `rader_index` being too small by a factor of two. The default
+was 20; it is now **45**. Nothing else changed.
+
+**The diagnostic was the residual, not the score.** Dividing each candidate's measured ns by its
+modelled cost gives a number that should be the same for every candidate at a length, since it is
+just cycle time over IPC. It was not. Rader's ran systematically high against Bluestein's at the
+same length, in ns per thousand cost units:
+
+```text
+len         59    233    373   1009   9661  99961  100801
+rad      114.8  115.4  109.4  106.0   83.9   80.2    77.9
+bs        85.8   79.4   75.7   76.6   64.8   65.3    65.3
+rad/bs    1.34   1.45   1.44   1.38   1.29   1.23    1.19
+```
+
+A ratio that is never 1 and decays with length is a missing cost that is **linear in `len`** while
+everything around it grows as `len log len`. `rader_index` is the only linear term Rader's has, so
+the shape named the term before any fitting.
+
+**The size comes from latency, and the old value was a bad guess at it.** The carried chain is
+`index = index * root % len` through a `StrengthReducedU64`: `mul -> umulh -> mul -> sub`, about
+10 cycles on both an M1 firestorm core and Coffee Lake. Ten cycles on a core retiring 4 to 6
+instructions per cycle is 40 to 60 instruction slots. 20 assumed a 3x inflation over the 7
+counted instructions; the right inflation is 6 to 7x. `RESULTS.md`'s own reproduce commands
+already passed `--rader-index 50`, so the default had simply drifted from the documented value.
+
+**Why the old value survived.** `RESULTS.md` records the weight as flat from 15 to 120, and on the
+original 33 lengths it is: they are all 1000 or larger and none is prime below 983, so the one
+term that matters most at small `len` had nothing to constrain it. At the old weight the term was
+31% of a Rader's cost at len 1009 and 7% at len 100003; at 45 it is 50% and 15%.
+
+**Result.** The residual flattens at every length across three decades, which is the real evidence
+this is a term and not a fit:
+
+```text
+len         59    233    373   1009   9661  99961  100801
+rad       82.6   84.6   80.6   78.4   68.8   67.1    65.0
+bs        85.8   79.4   75.7   78.5   64.8   65.3    65.3
+```
+
+Over all 54 prime lengths in the five NEON and SSE datasets, the Rader's-versus-Bluestein's call
+goes from 42/54 to **54/54**. Scores, same weights otherwise:
+
+| dataset | was | now |
+|---|---|---|
+| NEON f64 (44) | 1.0207 / 1.2747 | **1.0048 / 1.0582** |
+| NEON f32 (44) | 1.0706 / 1.6397 | **1.0338 / 1.2249** |
+| SSE f64 (33) | 1.1064 / 1.3230 | **1.0892 / 1.3230** |
+| SSE f32 (33) | 1.0368 / 1.2593 | **1.0290 / 1.1626** |
+
+mean / worst. No dataset regresses. Held out on the f64 splits, fitting on train only: train
+1.0269 -> 1.0073, test 1.0146 -> **1.0022**, worst 1.1456 -> 1.0246. The train optimum is the
+plateau starting at 45 and the test half agrees, so this is not overfitting.
+
+**The window is 40 to 52**, over which 52 to 54 of the 54 calls are right and every miss is a
+near-tie costing at most 3.3%. 45 is the only value taking all 54. Outside it the errors are real:
+20 gets 12 wrong, at up to 1.64x, and 55 gets 4.
+
+**This strengthens Track A rather than replacing it.** 54/54 against a hardcoded
+`MAX_RADER_PRIME_FACTOR` that provably cannot be right at any value is the same argument as
+before, now over three size decades instead of one and including small primes. Caveat 4 in
+`RESULTS.md` still holds and matters more at 45 than at 20: if `raders_precompute` lands and turns
+the chain into a table lookup, this weight has to be re-derived from the new latency, and it is now
+a large enough share of the cost that getting it wrong flips calls.
+
+**Uncommitted state in this worktree.** `counted.rs` (the `general_row` term and the `rader_index`
+default) and `main.rs` (the `--general-row` flag) are the real change. `main.rs` also carries a
+throwaway `sweep` subcommand used only for the 1..1000 comparison and its artifact; **it is not to
+be committed**, so drop those hunks before committing anything else from `main.rs`. The dump and
+split files are regenerated data.
 
 ## State of the work
 
@@ -102,7 +168,7 @@ projects and the evidence now favours the scoped one.
 | what it does | replaces one hand-tuned constant with a two-candidate cost comparison | enumerates candidates and prices them all |
 | plan-time cost | negligible | 20x to 1265x the fixed planner, 0.02-0.6 ms |
 | new machinery | a cost function, no enumeration | enumeration inside every planner |
-| evidence it works | Rader's vs Bluestein's: 29 of 30 correct across both backends | mean 1.003-1.052, worst 1.043-1.152 |
+| evidence it works | Rader's vs Bluestein's: 54 of 54 correct across both backends | mean 1.003-1.052, worst 1.043-1.152 |
 | risk | low, one decision, auditable by recipe diff | changes every plan, machine-dependent weights uncharacterised |
 
 ## Track A: ship the scoped win (recommended)
@@ -113,7 +179,8 @@ Replace `MAX_RADER_PRIME_FACTOR` with a comparison of the two trees `design_prim
 rule must answer them identically, and the truth does not agree: 1013 wants Bluestein's by 1.13x on
 NEON and 1.30x on SSE, while 9661 and 100189 want Rader's by 1.09x to 1.39x. No threshold on that
 quantity can be correct at any value. 991 adds a backend-dependent answer, Rader's by 1.4% on NEON
-and losing by 14.5% on SSE. The counted model gets 14 of 15 on NEON and 15 of 15 on SSE.
+and losing by 14.5% on SSE. With `rader_index` at 45 the counted model gets 15 of 15 on both
+backends, at mean regret 1.0004 on NEON and 1.0074 on SSE.
 
 1. Port the minimum of `counted.rs` into the crate: the butterfly tables, `mul_complex`, and enough
    of the pass model to price a `Raders` tree against a `Bluesteins` tree. No enumeration.

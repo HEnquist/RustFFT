@@ -177,6 +177,24 @@ pub struct Params {
     /// because `index` feeds the next iteration, making the chain loop-carried and latency-bound
     /// rather than throughput-bound. This weight converts the counted instructions into the
     /// effective cost of that serial chain.
+    ///
+    /// **Size it from the latency, not the instruction count.** The carried chain is
+    /// `mul -> umulh -> mul -> sub`, which is about 10 cycles on both an M1 firestorm core and
+    /// Coffee Lake. Ten cycles of a core that retires 4 to 6 instructions per cycle is 40 to 60
+    /// instruction slots, so the weight belongs near 45, not near the 7 instructions counted.
+    /// The old default of 20 assumed a 3x latency inflation and was too small by a factor of two.
+    ///
+    /// The old value survived only because the original 33 lengths were all 1000 or larger and
+    /// held no small primes. The term is linear in `len` while everything around it grows as
+    /// `len log len`, so at the old weight it was 31% of a Rader's cost at len 1009 and 7% at
+    /// len 100003, and at 45 it is 50% and 15%: exactly the lengths the first dataset could not
+    /// see are the ones that pin it down. On the
+    /// extended set it decides the Rader's-versus-Bluestein's call at 59, 233, 373, 1013 and 1021.
+    ///
+    /// Over all 54 prime lengths in the five NEON and SSE datasets, the family call is right at
+    /// 52 to 54 of them for anything in 40 to 52, and every miss inside that window is a near-tie
+    /// costing at most 3.3%. 45 is the only value that takes all 54. Outside it the errors are
+    /// real: 20 gets 12 wrong, at up to 1.64x, and 55 gets 4.
     pub rader_index: f64,
     /// Cost of one spilled vector per unrolled group in a RadixN cross layer, as a store plus a
     /// reload. Zero disables the register-pressure term entirely.
@@ -252,7 +270,7 @@ impl Default for Params {
             seq: [1.0, 2.0, 6.0],
             strided_mult: 1.5,
             permuted_mult: 2.5,
-            rader_index: 20.0,
+            rader_index: 45.0,
             spill: 0.0,
             radixn_extra: 0.0,
             mul_complex: -1.0,
