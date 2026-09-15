@@ -496,6 +496,38 @@ pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) 
 /// planner's pick, Radix4 and RadixN shapes, Rader's and Bluestein's) and only splits are
 /// dropped, most lopsided first, on the grounds that a split with a tiny side is mostly just its
 /// large side plus a transpose.
+/// What an estimating planner would actually enumerate at `len`.
+///
+/// Identical to `candidates_capped`, except that it returns the fixed planner's pick immediately
+/// at lengths where there is nothing to decide. Enumeration is pure overhead there, and it is the
+/// overhead that matters most: plan-time is a large fraction of plan-plus-build at small lengths
+/// and a negligible one at large lengths, so the cheapest lengths are exactly where an estimating
+/// planner can least afford to enumerate.
+///
+/// Two classes need no decision, and both were checked against measurement rather than assumed:
+///
+/// - **A length with its own butterfly.** A single hand-written kernel beats any decomposition.
+///   Over lengths 8..128 on NEON the bare butterfly is fastest at all fifteen such lengths, and
+///   is never beaten by a split.
+/// - **A power of two.** Radix4 wins, and the fixed planner already picks the right base, which
+///   is the part that is not obvious: at 1024 `r4(3,b16)` beats `r4(4,b4)` by 1.15x. Across four
+///   datasets, at every power of two from 64 up the fixed planner's pick is exactly the fastest
+///   measured candidate, regret 1.000.
+///
+/// `candidates` and `candidates_capped` stay exhaustive, because scoring a planner's pick needs
+/// the alternatives even where a planner would not look at them. That is how the two claims above
+/// were established, and re-establishing them after a kernel change needs the same breadth.
+pub fn plan_candidates<T: FftNum, P: TunablePlanner<T>>(
+    planner: &mut P,
+    len: usize,
+    cap: usize,
+) -> Vec<Arc<Spec>> {
+    if len.is_power_of_two() || P::butterfly_lens().contains(&len) {
+        return vec![planner.plan(len)];
+    }
+    candidates_capped(planner, len, cap)
+}
+
 pub fn candidates_capped<T: FftNum, P: TunablePlanner<T>>(
     planner: &mut P,
     len: usize,

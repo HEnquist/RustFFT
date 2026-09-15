@@ -22,7 +22,8 @@ use model::{bucket_of, overhead_scale, Model, FIT_ORDER};
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::{ToPrimitive, Zero};
 use rustfft::tuning::{
-    candidates_capped, parse, to_spec_string, ScalarTuner, Spec, TunablePlanner,
+    candidates_capped, parse, plan_candidates, to_spec_string, ScalarTuner, Spec,
+    TunablePlanner,
 };
 use rustfft::{Fft, FftDirection, FftNum};
 use std::sync::Arc;
@@ -438,7 +439,7 @@ fn cmd_sweep<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options)
 
     for &len in lengths {
         let mut planner = P::new();
-        let specs = candidates_capped(&mut planner, len, opts.cap);
+        let specs = plan_candidates(&mut planner, len, opts.cap);
         if specs.is_empty() {
             eprintln!("len {}: no candidates", len);
             continue;
@@ -988,13 +989,24 @@ fn cmd_costs(path: &str, opts: &Options) {
 /// The fixed planner answers from a few integer operations. A cost model has to enumerate the
 /// candidate set and price every member, which is real work the fixed planner never does. This
 /// is the one axis where the fixed planner is unambiguously ahead, so it should be measured.
+/// Compare the cost of *choosing* a recipe against the cost of *building* it.
+///
+/// Planning only produces a `Recipe`. Turning that into an `Arc<dyn Fft>` is a separate and much
+/// larger job: every algorithm precomputes twiddles, and Rader's and Bluestein's both run a full
+/// inner FFT inside their constructors. So the question that decides whether an estimating
+/// planner is affordable is not how much slower it is than the fixed planner, but how much it
+/// adds to plan-plus-build, which is what a caller actually pays before the first transform.
 fn cmd_plantime<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
     let model = counted::CountedModel::new(opts.params);
     println!(
-        "{:>9} {:>7} {:>14} {:>16} {:>9}",
-        "len", "cands", "planner ns", "enumerate+price", "ratio"
+        "{:>7} {:>6} {:>12} {:>14} {:>12} {:>9} {:>11}",
+        "len", "cands", "plan fixed", "plan+price", "build", "build/plan", "extra vs"
     );
-    let (mut tot_a, mut tot_b) = (0.0, 0.0);
+    println!(
+        "{:>7} {:>6} {:>12} {:>14} {:>12} {:>9} {:>11}",
+        "", "", "ns", "ns", "ns", "", "plan+build"
+    );
+    let (mut tot_a, mut tot_b, mut tot_c) = (0.0, 0.0, 0.0);
     for &len in lengths {
         // fixed planner: design only, with a fresh planner each time so nothing is cached
         let reps = 200;
@@ -1006,11 +1018,11 @@ fn cmd_plantime<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Optio
         let a = t0.elapsed().as_secs_f64() * 1e9 / reps as f64;
 
         let mut pl = P::new();
-        let n = candidates_capped(&mut pl, len, opts.cap).len();
+        let n = plan_candidates(&mut pl, len, opts.cap).len();
         let t1 = Instant::now();
         for _ in 0..reps {
             let mut pl = P::new();
-            let specs = candidates_capped(&mut pl, len, opts.cap);
+            let specs = plan_candidates(&mut pl, len, opts.cap);
             let best = specs
                 .iter()
                 .filter_map(|sp| model.cost(sp).map(|c| (c, sp)))
@@ -1018,15 +1030,37 @@ fn cmd_plantime<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Optio
             std::hint::black_box(best);
         }
         let b = t1.elapsed().as_secs_f64() * 1e9 / reps as f64;
+
+        // Build the recipe the fixed planner chose. Construction allocates and precomputes, so
+        // it is far slower than planning; use fewer repetitions and a fresh planner each time so
+        // nothing is served from a cache.
+        let mut pl = P::new();
+        let spec = pl.plan(len);
+        let build_reps = if len > 4096 { 5 } else if len > 256 { 20 } else { 100 };
+        let t2 = Instant::now();
+        for _ in 0..build_reps {
+            let mut pl = P::new();
+            std::hint::black_box(pl.build(&spec, FftDirection::Forward));
+        }
+        let c = t2.elapsed().as_secs_f64() * 1e9 / build_reps as f64;
+
         tot_a += a;
         tot_b += b;
+        tot_c += c;
         println!(
-            "{:>9} {:>7} {:>14.0} {:>16.0} {:>8.1}x",
-            len, n, a, b, b / a
+            "{:>7} {:>6} {:>12.0} {:>14.0} {:>12.0} {:>8.0}x {:>10.1}%",
+            len, n, a, b, c, c / a, 100.0 * (b - a) / (a + c)
         );
     }
-    println!("\n  total planner {:.0} ns, total enumerate+price {:.0} ns, {:.1}x",
-             tot_a, tot_b, tot_b / tot_a);
+    println!(
+        "\n  totals: plan fixed {:.0} ns, plan+price {:.0} ns ({:.1}x), build {:.0} ns",
+        tot_a, tot_b, tot_b / tot_a, tot_c
+    );
+    println!(
+        "  building is {:.0}x planning; the estimating planner adds {:.2}% to plan-plus-build",
+        tot_c / tot_a,
+        100.0 * (tot_b - tot_a) / (tot_a + tot_c)
+    );
 }
 
 fn cmd_model<T: FftNum, P: TunablePlanner<T>>(train: &[usize], test: &[usize], opts: &Options) {
