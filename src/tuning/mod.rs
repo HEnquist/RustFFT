@@ -322,6 +322,21 @@ pub fn check_unambiguous(spec: &Spec, seen: &mut HashMap<usize, String>) -> Resu
 /// Deliberately broader than what any planner would consider: the point is to find what the best
 /// available recipe actually is, so a planner's pick can be scored against it.
 pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) -> Vec<Arc<Spec>> {
+    candidates_inner(planner, len, false)
+}
+
+/// `candidates`, optionally skipping the wider-of-the-two-first ordering of each split.
+///
+/// The prune has to happen here rather than as a filter afterwards. Generating a candidate costs
+/// far more than pricing one: it renders the spec to a string, scans the seen-list linearly, and
+/// walks the tree to check it is unambiguous. Filtering after the fact at length 1200 cut the
+/// candidate count from 48 to 32 but plan time only from 211us to 181us; skipping the work up
+/// front is what actually saves it.
+fn candidates_inner<T: FftNum, P: TunablePlanner<T>>(
+    planner: &mut P,
+    len: usize,
+    prune_reversed: bool,
+) -> Vec<Arc<Spec>> {
     let mut out: Vec<Arc<Spec>> = vec![planner.plan(len)];
     let mut seen: Vec<String> = vec![to_spec_string(&out[0])];
 
@@ -344,15 +359,25 @@ pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) 
             continue;
         }
         let right_len = len / left_len;
+        if prune_reversed && left_len > right_len {
+            continue;
+        }
         let left = planner.plan(left_len);
         let right = planner.plan(right_len);
         let coprime = gcd(left_len, right_len) == 1;
         let small = left_len < 33 && right_len < 33;
 
-        for (left, right) in [
-            (Arc::clone(&left), Arc::clone(&right)),
-            (Arc::clone(&right), Arc::clone(&left)),
-        ] {
+        // Both orderings, unless pruning. The loop above already restricts `left_len` to the
+        // smaller half when pruning, so the surviving order is the smaller-width-first one.
+        let orders: Vec<(Arc<Spec>, Arc<Spec>)> = if prune_reversed {
+            vec![(Arc::clone(&left), Arc::clone(&right))]
+        } else {
+            vec![
+                (Arc::clone(&left), Arc::clone(&right)),
+                (Arc::clone(&right), Arc::clone(&left)),
+            ]
+        };
+        for (left, right) in orders {
             for small_flag in if small {
                 vec![false, true]
             } else {
@@ -514,9 +539,23 @@ pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) 
 ///   datasets, at every power of two from 64 up the fixed planner's pick is exactly the fastest
 ///   measured candidate, regret 1.000.
 ///
+/// It also drops the wider-of-the-two-first ordering of every split. Each two-way split is
+/// otherwise enumerated twice, which roughly doubles the candidate count at a highly composite
+/// length for almost no information: the two orderings differ only in how `transpose_small` walks
+/// the rectangle and in which inner FFT runs first. The smaller-width ordering is the better one
+/// in 90 to 97% of measured pairs for the Small variants, and for the general variants the two
+/// are usually indistinguishable, which makes dropping one free rather than merely cheap.
+///
+/// Measured over four datasets, that keeps 58 to 63% of candidates for a geometric mean regret of
+/// 1.0016 or better against the full set. The worst single case is 1.129x at length 62 on NEON
+/// f32, where `gts(b31,b2)` beats `gts(b2,b31)`; both known exceptions involve b31 or b32, where
+/// the parallel-pair f32 butterflies make the chunk count matter in a way none of this models.
+/// The planner's own pick is always element zero, so pruning can never leave an estimating
+/// planner worse than the fixed one.
+///
 /// `candidates` and `candidates_capped` stay exhaustive, because scoring a planner's pick needs
-/// the alternatives even where a planner would not look at them. That is how the two claims above
-/// were established, and re-establishing them after a kernel change needs the same breadth.
+/// the alternatives even where a planner would not look at them. That is how every claim above
+/// was established, and re-establishing them after a kernel change needs the same breadth.
 pub fn plan_candidates<T: FftNum, P: TunablePlanner<T>>(
     planner: &mut P,
     len: usize,
@@ -525,7 +564,7 @@ pub fn plan_candidates<T: FftNum, P: TunablePlanner<T>>(
     if len.is_power_of_two() || P::butterfly_lens().contains(&len) {
         return vec![planner.plan(len)];
     }
-    candidates_capped(planner, len, cap)
+    cap_list(candidates_inner(planner, len, true), cap)
 }
 
 pub fn candidates_capped<T: FftNum, P: TunablePlanner<T>>(
@@ -533,7 +572,11 @@ pub fn candidates_capped<T: FftNum, P: TunablePlanner<T>>(
     len: usize,
     cap: usize,
 ) -> Vec<Arc<Spec>> {
-    let all = candidates(planner, len);
+    cap_list(candidates(planner, len), cap)
+}
+
+/// Trim a candidate list to `cap`, keeping the planner's pick and the most balanced splits.
+fn cap_list(all: Vec<Arc<Spec>>, cap: usize) -> Vec<Arc<Spec>> {
     if all.len() <= cap {
         return all;
     }
