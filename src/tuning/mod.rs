@@ -335,7 +335,7 @@ pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) 
 fn candidates_inner<T: FftNum, P: TunablePlanner<T>>(
     planner: &mut P,
     len: usize,
-    prune_reversed: bool,
+    planning: bool,
 ) -> Vec<Arc<Spec>> {
     let mut out: Vec<Arc<Spec>> = vec![planner.plan(len)];
     let mut seen: Vec<String> = vec![to_spec_string(&out[0])];
@@ -359,7 +359,7 @@ fn candidates_inner<T: FftNum, P: TunablePlanner<T>>(
             continue;
         }
         let right_len = len / left_len;
-        if prune_reversed && left_len > right_len {
+        if planning && left_len > right_len {
             continue;
         }
         let left = planner.plan(left_len);
@@ -369,7 +369,7 @@ fn candidates_inner<T: FftNum, P: TunablePlanner<T>>(
 
         // Both orderings, unless pruning. The loop above already restricts `left_len` to the
         // smaller half when pruning, so the surviving order is the smaller-width-first one.
-        let orders: Vec<(Arc<Spec>, Arc<Spec>)> = if prune_reversed {
+        let orders: Vec<(Arc<Spec>, Arc<Spec>)> = if planning {
             vec![(Arc::clone(&left), Arc::clone(&right))]
         } else {
             vec![
@@ -483,7 +483,33 @@ fn candidates_inner<T: FftNum, P: TunablePlanner<T>>(
     // pattern is a composite whose factorisation forces Rader's onto a large prime factor:
     // Rader's permutation work is scalar, so at f32 it does not shrink while everything around
     // it does.
-    if len > 3 {
+    // When planning, offer Bluestein's only where the direct route can actually be bad: some
+    // prime factor with no butterfly of its own, which is what forces Rader's or an awkward
+    // split. If every prime factor has a butterfly the decomposition is all butterflies and
+    // Bluestein's, which needs an inner FFT of at least 2*len - 1, cannot compete. Across the
+    // four 1..1000 sweeps the model picked Bluestein's at 1315 lengths and **not one** of them
+    // had all its prime factors covered, so this costs nothing and skips the enumeration at
+    // every smooth length. `candidates` still offers it everywhere, which is how that was
+    // checked and how it would be re-checked.
+    let bluesteins_worth_it = !planning || {
+        let butterflies = P::butterfly_lens();
+        let mut n = len;
+        let mut uncovered = false;
+        let mut d = 2;
+        while d * d <= n {
+            while n % d == 0 {
+                uncovered |= !butterflies.contains(&d);
+                n /= d;
+            }
+            d += 1;
+        }
+        if n > 1 {
+            uncovered |= !butterflies.contains(&n);
+        }
+        uncovered
+    };
+
+    if len > 3 && bluesteins_worth_it {
         let min_inner = 2 * len - 1;
         let mut inner_lens: Vec<usize> = Vec::new();
         for multiplier in [1usize, 3, 5, 7, 9, 15] {
