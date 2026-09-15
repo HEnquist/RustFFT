@@ -433,7 +433,7 @@ pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) 
         }
     }
 
-    // Prime lengths: Rader's, plus Bluestein's over a range of inner lengths.
+    // Prime lengths: Rader's. It needs len - 1 to factor, so it is genuinely prime-only.
     if len > 3 && crate::math_utils::PrimeFactors::compute(len).is_prime() {
         push(
             Arc::new(Spec::Raders {
@@ -442,7 +442,23 @@ pub fn candidates<T: FftNum, P: TunablePlanner<T>>(planner: &mut P, len: usize) 
             &mut out,
             &mut seen,
         );
+    }
 
+    // Bluestein's over a range of inner lengths, at **every** length and not only at primes.
+    //
+    // Nothing about Bluestein's needs a prime: the only requirement is an inner FFT of at least
+    // 2*len - 1. The shipping planner reaches it solely from `design_prime`, so a composite can
+    // never be given it, and that is a real loss rather than a theoretical one. Length 671 is
+    // 11 x 61; its only candidates were a MixedRadix or GoodThomas wrapped around a Rader's for
+    // 61, and it measured slower than both of its prime neighbours 673 and 677, which do get
+    // Bluestein's. Built by hand, bs(671, r4(3,b24)) is 1.46x faster than the planner's pick.
+    //
+    // Over 1..1000 the lengths whose pick is more than 5% slower than Bluestein's costs nearby
+    // number 374 on NEON f32 at a geometric mean of 1.405x, and 357 on SSE f32 at 1.306x. The
+    // pattern is a composite whose factorisation forces Rader's onto a large prime factor:
+    // Rader's permutation work is scalar, so at f32 it does not shrink while everything around
+    // it does.
+    if len > 3 {
         let min_inner = 2 * len - 1;
         let mut inner_lens: Vec<usize> = Vec::new();
         for multiplier in [1usize, 3, 5, 7, 9, 15] {
