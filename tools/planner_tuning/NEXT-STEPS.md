@@ -196,6 +196,59 @@ Reproduce, on a machine with the SSE backend:
     --general-row 30 --rader-index 45 1..1000 > sweep_sse_f64_rader.tsv
 ```
 
+## Update, 2026-09-15: Bluestein's is never offered at composite lengths
+
+Found by reading the f32 sweep around length 671. 671 is composite, 11 x 61, and runs at
+8830 ns. 673 and 677 are prime, take Bluestein's, and run at 6214 and 6135 ns. A composite
+length is slower than both of its prime neighbours, which should not happen: **Bluestein's
+works at any length**, so it is available as an option everywhere, and its cost depends only on
+the inner length it picks.
+
+It is not offered. `Recipe::BluesteinsAlgorithm` is constructed in exactly one place,
+`design_prime` in `plan.rs`, so it is structurally unreachable for a composite. The tuning
+enumerator has the same shape: `src/tuning/mod.rs` gates both Rader's and Bluestein's behind
+one `PrimeFactors::compute(len).is_prime()`. Length 671 enumerates **8 candidates, all of them
+`gt` or `mr` wrapped around a `rad`**, and none is Bluestein's.
+
+Timed directly, `bs(671, r4(3,b24))` runs at 6153 ns against the planner's 8961, a **1.46x**
+win, and lands between its two prime neighbours exactly as the argument predicts.
+
+**Scale.** Counting lengths whose chosen recipe is more than 5% slower than Bluestein's costs
+nearby, out of 1000:
+
+| | lengths | geometric mean | best |
+|---|---|---|---|
+| NEON f32 | **374** | **1.405x** | 1.976x |
+| SSE f32 | 357 | 1.306x | 2.041x |
+| SSE f64 | 98 | 1.173x | 1.507x |
+| NEON f64 | 60 | 1.117x | 1.473x |
+
+The estimate uses the measured cost of Bluestein's at nearby lengths as a proxy. Spot-checking
+it by building and timing the recipe directly confirms it at every length tried: 122 predicted
+1.98x and measures 1.98x, 111 predicted 1.78x measures 1.78x, 183 predicted 1.96x measures
+1.96x, 982 predicted 1.84x measures 1.85x.
+
+**The cost model would already exploit it.** Pricing the two recipes by hand at 111, 122, 183,
+671 and 982, the model ranks Bluestein's first at all five. Nothing in the model needs to
+change; this is purely an enumeration defect.
+
+**Why f32 hurts most.** The losing recipes are almost all a composite whose factorisation forces
+Rader's on a large prime factor, and Rader's permutation and pointwise work is scalar. At f32
+the surrounding FFT arithmetic halves per element while that scalar work does not, so the
+factored recipe gets relatively worse exactly where Bluestein's inner FFT is still vectorising.
+
+**This makes every regret figure in this project a looser lower bound than `RESULTS.md`
+caveat 3 says.** All of them are measured against a candidate set that, at f32, is missing the
+best option at about 37% of lengths.
+
+**What to do.** Lift the Bluestein's block out of the prime guard in the tuning enumerator and
+re-run the sweep; that is a small change and it measures the real gain rather than a proxy. The
+shipping-planner version is the larger question, and it has a cost the proxy does not show:
+Bluestein's needs an inner FFT of at least `2n - 1`, so at 671 the buffers go from 671 to 1536
+complex, roughly 2.3x the memory and scratch. A planner that takes Bluestein's at composite
+lengths trades memory for speed, and that should be a deliberate choice rather than a
+side effect.
+
 ## State of the work
 
 Branch `counted_cost_spike`, worktree `/Users/henrik/repos/RustFFT-counted`, based on
