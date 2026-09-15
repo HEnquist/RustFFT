@@ -733,8 +733,14 @@ fn cmd_score(path: &str, opts: &Options) {
     use std::collections::BTreeMap;
     let text = std::fs::read_to_string(path).expect("cannot read dump");
 
-    // len -> spec -> (best ns, is planner pick). Pass 2 overwrites pass 1.
-    let mut data: BTreeMap<usize, BTreeMap<String, (f64, bool)>> = BTreeMap::new();
+    // len -> [(spec, best ns, is planner pick)]. Pass 2 overwrites pass 1.
+    //
+    // The inner container must preserve the dump's own order, which is the order
+    // `candidates_capped` enumerated in. The planner takes the first minimum in that order, so
+    // replay has to break cost ties the same way or it does not model the planner. Keying by
+    // spec string instead sorts `gts(b10,b3)` ahead of `gts(b3,b10)`, which is the opposite of
+    // the enumeration order and silently reverses every width/height tie.
+    let mut data: BTreeMap<usize, Vec<(String, f64, bool)>> = BTreeMap::new();
     for line in text.lines() {
         if line.starts_with('#') || line.starts_with("len\t") {
             continue;
@@ -750,13 +756,15 @@ fn cmd_score(path: &str, opts: &Options) {
             f[3].parse::<u32>().unwrap(),
             f[4] == "1",
         );
-        let e = data.entry(len).or_default();
-        match e.get(&spec) {
+        let e: &mut Vec<(String, f64, bool)> = data.entry(len).or_default();
+        match e.iter_mut().find(|r| r.0 == spec) {
             // pass 2 is the careful re-timing, so it wins
-            Some(_) if pass == 1 => {}
-            _ => {
-                e.insert(spec, (ns, pick));
+            Some(row) if pass != 1 => {
+                row.1 = ns;
+                row.2 = pick;
             }
+            Some(_) => {}
+            None => e.push((spec, ns, pick)),
         }
     }
 
@@ -781,11 +789,11 @@ fn cmd_score(path: &str, opts: &Options) {
 
     let (mut mr, mut pr) = (Vec::new(), Vec::new());
     for (&len, rows) in &data {
-        let best = rows.values().map(|v| v.0).fold(f64::INFINITY, f64::min);
-        let planner_ns = rows.values().find(|v| v.1).map(|v| v.0);
+        let best = rows.iter().map(|v| v.1).fold(f64::INFINITY, f64::min);
+        let planner_ns = rows.iter().find(|v| v.2).map(|v| v.1);
 
         let mut scored: Vec<(String, f64, f64)> = Vec::new();
-        for (spec_text, (ns, _)) in rows {
+        for (spec_text, ns, _) in rows {
             let spec = match parse(spec_text) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -1288,6 +1296,7 @@ fn main() {
             "--mul-complex" => { i += 1; opts.params.mul_complex = args[i].parse().unwrap(); }
             "--spill" => { i += 1; opts.params.spill = args[i].parse().unwrap(); }
             "--general-row" => { i += 1; opts.params.general_row = args[i].parse().unwrap(); }
+            "--small-row" => { i += 1; opts.params.small_row = args[i].parse().unwrap(); }
             "--permuted-vector" => opts.params.permuted_scalar = false,
             "--f64" => opts.params.elem = counted::Elem::F64,
             "--backend" => { i += 1; opts.params.backend = counted::Backend::parse(&args[i]).expect("--backend wants neon or sse"); opts.backend_explicit = true; }

@@ -255,6 +255,55 @@ pub struct Params {
     /// 21 to 42; the binding constraints are Good-Thomas at 992 below and MixedRadix at 496
     /// above. 30 sits in the middle of that window.
     pub general_row: f64,
+    /// Cost of one outer-loop iteration of `array_utils::transpose_small`, charged to the
+    /// **Small** MixedRadix and GoodThomas variants only.
+    ///
+    /// This is the term that makes the model prefer one ordering of a factor pair over its
+    /// reverse. `transpose_small` is a naive double loop:
+    ///
+    /// ```text
+    /// for x in 0..width { for y in 0..height { out[y + x*height] = in[x + y*width] } }
+    /// ```
+    ///
+    /// The outer loop runs `width` times and the read index strides by `width`, so the cost
+    /// depends on which dimension is which. The general variants call the `transpose` crate,
+    /// which tiles the rectangle and so does not care: that contrast is the evidence, because
+    /// `GoodThomasAlgorithm` and `GoodThomasAlgorithmSmall` perform the *same single transpose
+    /// in the same orientation* and differ only in the implementation. Over reversed pairs the
+    /// small form measures smaller-width-faster at 90 to 97% on both machines and both element
+    /// types, while the general form splits about evenly and its median gap is 0.00 ns.
+    ///
+    /// Outer-loop iterations, counted from the source:
+    ///
+    /// - `GoodThomasAlgorithmSmall`: one transpose, `(width, height)`, so `width`.
+    /// - `MixedRadixSmall`: three, `(w,h)`, `(h,w)`, `(w,h)`, so `2*width + height`.
+    ///
+    /// Both change by exactly `width - height` when the pair is reversed, which predicts that
+    /// the two should show the same asymmetry per unit of `w - h` despite having different
+    /// absolute transpose counts. On SSE they measure 1.48 and 1.47 ns respectively.
+    ///
+    /// So the charge is `small_row * max(width - height, 0)`, not the raw iteration count. Both
+    /// variants differ by exactly `width - height` iterations between the two orderings, so one
+    /// weight covers both; charging the worse ordering that difference and the better one
+    /// nothing reproduces it. Only the *difference* is evidenced here, because the absolute
+    /// level of a Small variant against a general one is what `general_row` already carries,
+    /// fitted. Charging the difference rather than the count keeps three properties that matter:
+    ///
+    /// - a square pair is charged nothing, since there is no ordering to get wrong;
+    /// - the better ordering keeps exactly the cost it had before this term existed, so
+    ///   `general_row` stays valid and the Small-versus-general balance is untouched;
+    /// - the cost never goes negative.
+    ///
+    /// Charging the raw count instead regressed SSE f64 at length 1215, where the recipe is
+    /// `mr(b15, mrs(b9,b9))`: the nested square pair was inflated by its 15 repetitions and the
+    /// whole recipe lost to an `rn(3.3.3.3,b15)` that is 1.21x slower.
+    ///
+    /// The value is one outer iteration in instruction-equivalents: about 1.48 ns on the i3 and
+    /// 0.7 to 1.0 ns on the M1, which at each machine's ns-per-cost-unit is 9 to 13 either way.
+    /// It barely matters. Scores are byte-identical for anything from 2 to 24 on every dataset,
+    /// because the term only ever separates two orderings that are otherwise exactly equal in
+    /// cost. It is a tie-break with a derivation, not a fitted weight.
+    pub small_row: f64,
     /// Which backend's instruction costs to use.
     pub backend: Backend,
     /// Which element type.
@@ -276,6 +325,7 @@ impl Default for Params {
             mul_complex: -1.0,
             permuted_scalar: true,
             general_row: 30.0,
+            small_row: 10.0,
             backend: Backend::Neon,
             elem: Elem::F64,
         }
@@ -404,7 +454,12 @@ impl CountedModel {
                 // pays `general_row` per row of setup for it.
                 let pat = if *small { Pattern::Permuted } else { Pattern::Strided };
                 let mut c = 3.0 * self.mem(2.0 * len, pat, ws);
-                if !*small {
+                if *small {
+                    // transpose_small at (w,h), (h,w), (w,h) is 2*width + height outer
+                    // iterations; reversing the pair gives 2*height + width, so the two
+                    // orderings differ by width - height. See `small_row`.
+                    c += p.small_row * (left.len() as f64 - right.len() as f64).max(0.0);
+                } else {
                     c += p.general_row * self.rows(left, right);
                 }
                 c += (len / p.elem.complex_per_vector()) * self.mul_complex()
@@ -426,7 +481,12 @@ impl CountedModel {
                 let pat = if *small { Pattern::Permuted } else { Pattern::Strided };
                 let mut c = 2.0 * self.mem(2.0 * len, Pattern::Permuted, ws);
                 c += self.mem(2.0 * len, pat, ws);
-                if !*small {
+                if *small {
+                    // One transpose_small at (width, height): `width` outer iterations, against
+                    // `height` reversed. The same width - height difference as MixedRadixSmall,
+                    // which is why one weight serves both.
+                    c += p.small_row * (left.len() as f64 - right.len() as f64).max(0.0);
+                } else {
                     c += p.general_row * self.rows(left, right);
                 }
                 c += right.len() as f64 * self.cost_ws(left, ws)?;
