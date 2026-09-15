@@ -138,11 +138,22 @@ before, now over three size decades instead of one and including small primes. C
 the chain into a table lookup, this weight has to be re-derived from the new latency, and it is now
 a large enough share of the cost that getting it wrong flips calls.
 
-**Uncommitted state in this worktree.** `counted.rs` (the `general_row` term and the `rader_index`
-default) and `main.rs` (the `--general-row` flag) are the real change. `main.rs` also carries a
-throwaway `sweep` subcommand used only for the 1..1000 comparison and its artifact; **it is not to
-be committed**, so drop those hunks before committing anything else from `main.rs`. The dump and
-split files are regenerated data.
+**The `sweep` subcommand is no longer a throwaway.** An earlier draft of this document said it was
+not to be committed. That was wrong, and the reason it was wrong is the whole point of this update:
+the 33 and 44 length tuning sets could not tell us whether the model was right, because both
+defects above were invisible to them and only the full 1..1000 sweep exposed either. The sweep is
+the validation instrument, so it is committed, with `plot_sweep.py` alongside it.
+
+`plot_sweep.py` needs matplotlib, the only third-party dependency in this directory:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install matplotlib
+.venv/bin/python plot_sweep.py sweep_neon_f64.tsv            # one run
+.venv/bin/python plot_sweep.py sweep_*_f64_*.tsv             # compare stages or machines
+```
+
+It prints the same figures it draws, so it doubles as the reporting tool. Sweep output is `*.tsv`
+and gitignored, like every other measurement in here.
 
 ## State of the work
 

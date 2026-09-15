@@ -8,6 +8,7 @@
 //!   time SPEC...              time recipes against each other; a '*reps' suffix runs a recipe
 //!                             over a len*reps buffer, which is how inner FFTs are invoked
 //!   regret LEN...             measure how far the planner's pick is from the best available
+//!   sweep LEN... | A..B      time the planner's pick against the counted model's pick, as TSV
 //!   model TRAIN... 0 TEST...  calibrate a cost model and score its picks the same way
 //!   residuals LEN...          show how per-element overhead varies with working set
 //!   verify LEN...             check every enumerated candidate against a direct DFT
@@ -414,6 +415,90 @@ fn cmd_regret<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options
         println!("  {:>8}  {:.3}x", len, regret);
         println!("      planner: {}", planner_spec);
         println!("      best:    {}", best_spec);
+    }
+}
+
+/// Time the shipping planner's pick against the counted model's pick, at every length in a range.
+///
+/// Unlike `regret`, this builds and times only two recipes per length rather than the whole
+/// candidate set, which is what makes a thousand-length sweep affordable. When both agree, the
+/// recipe is timed once and reported for both, so an agreement shows as exactly 1.000 rather than
+/// as timing noise.
+///
+/// Output is TSV on stdout, one row per length, ready to plot.
+fn cmd_sweep<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
+    let model = counted::CountedModel::new(opts.params);
+
+    println!("# planner\t{}", P::label());
+    println!("# params\t{:?}", opts.params);
+    println!("# rounds\t{}\tblock_ms\t{}\tcap\t{}", opts.rounds, opts.block_ms, opts.cap);
+    println!(
+        "len\tcands\tagree\tplanner_ns\tmodel_ns\tratio\tplanner_norm\tmodel_norm\tplanner_spec\tmodel_spec"
+    );
+
+    for &len in lengths {
+        let mut planner = P::new();
+        let specs = candidates_capped(&mut planner, len, opts.cap);
+        if specs.is_empty() {
+            eprintln!("len {}: no candidates", len);
+            continue;
+        }
+
+        let model_index = specs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, spec)| model.cost(spec).map(|c| (i, c)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let agree = model_index == 0;
+        let planner_spec = to_spec_string(&specs[0]);
+        let model_spec = to_spec_string(&specs[model_index]);
+
+        let mut subjects: Vec<Subject<T>> = if agree {
+            vec![Subject::new(
+                planner_spec.clone(),
+                planner.build(&specs[0], FftDirection::Forward),
+                1,
+            )]
+        } else {
+            vec![
+                Subject::new(
+                    planner_spec.clone(),
+                    planner.build(&specs[0], FftDirection::Forward),
+                    1,
+                ),
+                Subject::new(
+                    model_spec.clone(),
+                    planner.build(&specs[model_index], FftDirection::Forward),
+                    1,
+                ),
+            ]
+        };
+        measure(&mut subjects, opts.rounds, opts.block_ms);
+
+        let planner_ns = subjects[0].best();
+        let model_ns = if agree { planner_ns } else { subjects[1].best() };
+
+        // n log2 n, the work a radix-2 FFT of this length would do. Undefined at len 1, where
+        // there is no work to normalise by.
+        let nlogn = (len as f64) * (len as f64).log2();
+        let norm = |ns: f64| if nlogn > 0.0 { ns / nlogn } else { f64::NAN };
+
+        println!(
+            "{}\t{}\t{}\t{:.2}\t{:.2}\t{:.4}\t{:.5}\t{:.5}\t{}\t{}",
+            len,
+            specs.len(),
+            if agree { 1 } else { 0 },
+            planner_ns,
+            model_ns,
+            planner_ns / model_ns,
+            norm(planner_ns),
+            norm(model_ns),
+            planner_spec,
+            model_spec
+        );
     }
 }
 
@@ -1090,6 +1175,7 @@ enum Command {
     Explain(String),
     Costs(String),
     Plantime(Vec<usize>),
+    Sweep(Vec<usize>),
 }
 
 fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
@@ -1100,6 +1186,7 @@ fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
     match command {
         Command::Time(specs) => cmd_time::<T, P>(specs, opts),
         Command::Regret(lengths) => cmd_regret::<T, P>(lengths, opts),
+        Command::Sweep(lengths) => cmd_sweep::<T, P>(lengths, opts),
         Command::Model(train, test) => cmd_model::<T, P>(train, test, opts),
         Command::Residuals(lengths) => cmd_residuals::<T, P>(lengths, opts),
         Command::Verify(lengths) => cmd_verify::<T, P>(lengths, opts),
@@ -1219,9 +1306,26 @@ fn main() {
             .collect()
     };
 
+    // `sweep` takes a thousand lengths, so accept "A..B" as well as a list.
+    let range_or_numbers = |values: &[String]| -> Vec<usize> {
+        let mut out = Vec::new();
+        for value in values {
+            match value.split_once("..") {
+                Some((lo, hi)) => {
+                    let lo: usize = lo.parse().expect("bad range start");
+                    let hi: usize = hi.parse().expect("bad range end");
+                    out.extend(lo..=hi);
+                }
+                None => out.push(value.parse().expect("lengths must be numbers")),
+            }
+        }
+        out
+    };
+
     let command = match command_name.as_str() {
         "time" => Command::Time(rest.clone()),
         "regret" => Command::Regret(numbers(&rest)),
+        "sweep" => Command::Sweep(range_or_numbers(&rest)),
         "residuals" => Command::Residuals(numbers(&rest)),
         "verify" => Command::Verify(numbers(&rest)),
         "emit" => Command::Emit(numbers(&rest)),

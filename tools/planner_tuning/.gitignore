@@ -5,3 +5,4 @@ Cargo.lock
 *.tsv
 *.log
 sweep*.txt
+.venv
