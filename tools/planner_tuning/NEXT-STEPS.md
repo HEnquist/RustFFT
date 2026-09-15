@@ -155,6 +155,47 @@ python3 -m venv .venv && .venv/bin/pip install matplotlib
 It prints the same figures it draws, so it doubles as the reporting tool. Sweep output is `*.tsv`
 and gitignored, like every other measurement in here.
 
+## Update, 2026-09-15: the same sweep on the ThinkCentre, and what it settles
+
+Both fixes were derived from M1 measurements. Repeating all six sweeps on the ThinkCentre
+(i3-8100T, SSE) asks whether they are mechanisms or M1 curve fits. They are mechanisms.
+
+Geometric mean of planner over model across all 1000 lengths, and losses beyond 2%:
+
+| | NEON f64 | SSE f64 | NEON f32 | SSE f32 |
+|---|---|---|---|---|
+| Original | 1.0101 / 123 | 0.9932 / **363** | 1.0125 / 216 | 1.0614 / 94 |
+| + crossover | 1.0182 / 27 | 1.0175 / **44** | 1.0499 / 92 | 1.0619 / 39 |
+| + Rader's | 1.0201 / 25 | 1.0224 / 54 | 1.0747 / 87 | 1.0774 / 34 |
+
+**The crossover term is the headline.** Fitted on the M1, it takes SSE f64 from 363 losses to 44
+and from a net loss (0.9932) to a net win. That is a different instruction set and a different
+memory system, and the term was not tuned on either. `general_row` is reading something real about
+`transpose_small` against the `transpose` crate, not absorbing an M1 artefact.
+
+**The Rader's term travels too**, and helps most where it was not fitted: SSE f32 goes 39 losses to
+34 at a better mean, and NEON f32 87. On SSE f64 it costs 10 losses for a better mean, the same
+small overshoot at short primes seen on NEON.
+
+**SSE is still the harder machine.** At the current model it holds 54 f64 losses against NEON's 25,
+and its worst is 0.687 at len 14 against NEON's 0.894 at len 21. Both worsts are the same shape,
+`rn(k,b7)` taken where `gts(bk,b7)` is faster, which is now the worst short-length defect on both
+machines and is not the width/height asymmetry.
+
+**What this does not settle.** Track B item 1 wants a *third* machine because instruction set and
+memory system are confounded across these two. That is unchanged: this run adds confidence that the
+terms are not machine-fitted, not a way to separate the two axes. pi5 and ryzen250 are still the
+instruments for that.
+
+Reproduce, on a machine with the SSE backend:
+
+```sh
+# --backend sse is mandatory: `sweep` takes the model params as given and does not infer
+# the backend from the planner the way `score` and `costs` do from a dump header.
+./target/release/planner_tuning sweep --planner sse --backend sse --radixn-extra 5 \
+    --general-row 30 --rader-index 45 1..1000 > sweep_sse_f64_rader.tsv
+```
+
 ## State of the work
 
 Branch `counted_cost_spike`, worktree `/Users/henrik/repos/RustFFT-counted`, based on
