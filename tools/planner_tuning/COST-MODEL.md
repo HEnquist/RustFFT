@@ -189,7 +189,7 @@ property of the machine.
 | `seq[0]`, `seq[1]`, `seq[2]` | one access at L1, L2, DRAM | pinned at 1.0; the other two are inert, see below |
 | `strided_mult` | a fixed-stride pass against a sequential one | 1.0, 1.5, 2.5, 4.0 |
 | `permuted_mult` | a gather or scatter against a sequential pass | 1.5, 2.5, 4.0, 6.0 |
-| `radixn_extra` | the generic `SimdRadixN` driver against the hand-written `Radix4` kernel, per element per layer | 0, 1, 2, 3, 5, 8 |
+| `radixn_extra` | the generic `SimdRadixN` driver against the hand-written `Radix4` kernel, per element per layer | 0, 1, 2, 3, 5, 8; defaults 0 on NEON, 6 on SSE f64, 1 on SSE f32, chosen by the 1..1000 sweep |
 | `general_row` | per-row setup of the blocked transpose and the on-the-fly CRT mapping | the twelve measured general-over-small ratios |
 
 `spill` and `mul_complex` are diagnostic overrides rather than fitted weights. Both are off by
@@ -257,6 +257,11 @@ positive on SSE, which is what a register-count argument predicts, since `cross_
 live and 2R fits 32 `v` registers at every supported radix and does not fit 16 `xmm`. It also shrinks
 from 5 to 2-3 when the element type halves, because a spilled register then covers twice the
 elements. Predicted 2.5, observed 2 to 3.
+
+**That was before the RadixN transpose fix** (415a29f), which removed per-call divides the weight had
+been partly absorbing. Refitted by the 1..1000 sweep on the ThinkCentre, the defaults are now 6 for
+SSE f64 and 1 for SSE f32, so the halving prediction no longer holds. Zero on NEON still does. The
+table above predates the fix; `NEXT-STEPS.md` has the refit.
 
 Note that `Params::default()` is the NEON working set with `permuted_mult` at 2.5 rather than the
 fitted 1.5. It makes no difference to that dataset, but a run that means to reproduce a table above

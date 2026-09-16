@@ -213,6 +213,20 @@ pub struct Params {
     /// the butterfly's temporaries; `sse_radix4.rs` is a hardcoded 2x unroll over six twiddles.
     /// 2R rows fits aarch64's 32 vector registers at every radix it supports, and does not fit
     /// x86-64's 16 xmm registers, so this is expected to be near zero on NEON and positive on SSE.
+    ///
+    /// The defaults, chosen by the 1..1000 sweep on the ThinkCentre after the transpose indices
+    /// were precomputed (see `NEXT-STEPS.md`):
+    ///
+    /// - NEON: **0**, both element types.
+    /// - SSE f64: **6**. 38 losses beyond 2% against 50 at 5, 84 at 8 and 180 at 12. The
+    ///   33-length dump alone points at 12 to 16, but every one of those lengths is 1000 or more.
+    /// - SSE f32: **1**. 20 losses against 25 at both 0 and 2, and a worst case of 0.909 against
+    ///   0.861 at 2.
+    ///
+    /// The SSE values were 5 and 2 before that change. Removing a per-call overhead let the f32
+    /// value come down, as expected; the f64 value moved up by one, not down.
+    ///
+    /// Negative means "use that per-backend default"; see `CountedModel::radixn_extra`.
     pub radixn_extra: f64,
     /// Override for the cost of one complex multiply. Negative means "use the backend's counted
     /// value". Exists to test whether SSE's shuffle-heavy `mul_complex` costs more than its
@@ -327,7 +341,7 @@ impl Default for Params {
             permuted_mult: 2.5,
             rader_index: -1.0,
             spill: 0.0,
-            radixn_extra: 0.0,
+            radixn_extra: -1.0,
             mul_complex: -1.0,
             permuted_scalar: true,
             general_row: 30.0,
@@ -364,6 +378,19 @@ impl CountedModel {
             match self.params.elem {
                 Elem::F64 => 30.0,
                 Elem::F32 => 45.0,
+            }
+        }
+    }
+
+    /// The RadixN driver cost actually in force. See `Params::radixn_extra` for the values.
+    fn radixn_extra(&self) -> f64 {
+        if self.params.radixn_extra >= 0.0 {
+            self.params.radixn_extra
+        } else {
+            match (self.params.backend, self.params.elem) {
+                (Backend::Neon, _) => 0.0,
+                (Backend::Sse, Elem::F64) => 6.0,
+                (Backend::Sse, Elem::F32) => 1.0,
             }
         }
     }
@@ -448,7 +475,7 @@ impl CountedModel {
                     // table applies directly. Row 0 needs no twiddle, hence r - 1.
                     c += (len / rf) * (p.backend.butterfly_compute(*r, p.elem)? + (rf - 1.0) * self.mul_complex());
                     c += self.mem(2.0 * len, Pattern::Strided, ws);
-                    c += len * p.radixn_extra;
+                    c += len * self.radixn_extra();
                     // Register pressure: the layer keeps 2R rows live across the two-column
                     // unroll. Anything past the architectural register file becomes a spill and a
                     // reload, once per element of the group.

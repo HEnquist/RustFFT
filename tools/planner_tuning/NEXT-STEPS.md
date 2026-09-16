@@ -4,6 +4,99 @@ Written 2026-09-11, at the end of the spike that produced `RESULTS.md`. That doc
 evidence; this one is the plan. Read `RESULTS.md` first for numbers, and `OP-COUNTS.md` for how the
 instruction counts were derived.
 
+## Update, 2026-09-16: the short-length RadixN defect was library overhead, now fixed
+
+**Symptom.** The 1..1000 sweeps picked RadixN at short composite lengths and lost. On the
+ThinkCentre f64 that was 15 to 35% at 14, 18, 20, 25, 30, 40, 49, 50, 72, 90 and 144 (worst 0.657
+at 14), and in f32 up to 0.646 at 28. The M1 lost 16% at 14, shrinking to nothing by 56. The model
+priced `rn` 4 to 23% below the `gts`/`mrs` alternative at those lengths, so this was a pricing
+error, not a near tie. On the M1 the gap was a roughly constant 4 to 6 ns: a cost per call.
+
+**Cause.** Read off the M1 disassembly of `SimdRadixN`. Per execution, and on top of the per-element
+work the model counts:
+
+- `factor_transpose` divides by runtime values twice (`input.len() / height`, `% width`), and
+  recomputes every column's reversed index through an out-of-line `reverse_remainders` call that
+  walks the factor list.
+- `chunks_exact_mut(cross_fft_len)` in `cross_ffts` adds one more divide per cross layer.
+
+`GoodThomasAlgorithmSmall` reads its permutation from a table and does none of this. A 64-bit divide
+takes tens of cycles on Coffee Lake and a few on the M1, which is why SSE was hit much harder.
+
+**Fix, in the library.** 415a29f on `simd_radixn_split` (draft ejmahler/RustFFT#179), merged here.
+`new()` precomputes the reversed column table, and the layers walk their chunks with
+`split_at_mut`. Per-element work is unchanged, and the scalar `RadixN` still uses
+`factor_transpose`. RadixN time after over before, same recipe:
+
+| | M1 short (14 to 42) | M1 long | ThinkCentre, to 150 | ThinkCentre, above 150 |
+|---|---|---|---|---|
+| f64 | 0.87 to 0.94 | 0.86 to 0.97 | 0.925 | 0.945 |
+| f32 | 0.77 to 0.92 | 0.83 to 0.96 | 0.862 | 0.953 |
+
+Recipes without RadixN moved 0 to 2% on both machines, which is drift. The gain growing with column
+count explains the long lengths: `rn(7.3.3,b10)` at 630 got 14% (f64) and 17% (f32) faster on the M1.
+
+**`radixn_extra` refit on SSE.** Fresh ThinkCentre dumps at the 33 lengths (`dump_sse_fix_f64`,
+`dump_sse_fix_f32`) and at every length 8 to 128 (`dump_sse_fix_short`, `dump_sse_fix_short_f32`),
+then 1..1000 sweeps at the candidates (`sweep_tc_fix_rx*`, `sweep_tc_fix_f64`, `sweep_tc_fix_f32`).
+Geomean planner/model / losses beyond 2% / worst:
+
+| f64 | all | losses to 150 | losses above 150 |
+|---|---|---|---|
+| before the fix, 5 | 1.0252 / 46 / 0.657 | | |
+| 5 | 1.0143 / 50 / 0.751 | 12 | 38 |
+| **6** | 1.0176 / **38** / 0.746 | 7 | 31 |
+| 8 | 1.0183 / 84 / 0.750 | 5 | 79 |
+| 12 | 1.0141 / 180 / 0.741 | 9 | 171 |
+
+| f32 | all | losses to 150 |
+|---|---|---|
+| before the fix, 2 | 1.1731 / 36 / 0.646 | |
+| 0 | 1.1671 / 25 / 0.911 | 2 |
+| **1** | 1.1681 / **20** / 0.909 | 1 |
+| 2 | 1.1657 / 25 / 0.861 | 0 |
+
+**The defaults are now 6 for SSE f64 and 1 for SSE f32, still 0 on NEON.** `Params::radixn_extra`
+is `-1.0`, resolved per backend and element type by `CountedModel::radixn_extra`, the same idiom as
+`rader_index`. An explicit `--radixn-extra` still overrides.
+
+- **f32 agrees everywhere.** The train half picks 0 or 1 (the old dump picked 2 or 3), the held-out
+  half scores 1.003 / 1.043 at 1 against 1.011 / 1.131 at 2, and the sweep has the fewest losses and
+  a much better worst case at 1. Removing a per-call cost let the per-element weight come down.
+- **f64 does not.** Fitted on the train half, the 33-length dump keeps improving up to 12 or 16, at
+  the sweep weights and in the full 216-point grid. The pre-fix dump did the same, so this is not
+  the fix. But those lengths are all 1000 or more, and in the sweep anything above 6 backfires. The
+  sweep decides, as it did for `rader_index`. 6 also beats 5 on the held-out half (1.037 / 1.130
+  against 1.051 / 1.236). So the register-count story's neat f32-is-half-of-f64 prediction no
+  longer holds: 6 against 1, not 5 against 2.5.
+
+**What is left.**
+
+1. **Short lengths still need two things one weight cannot give.** At 5 the model still takes
+   `rn(2,b7)` at 14 (8% slow) and `rn(2,b15)` at 30 (14% slow); at 6 those are fixed and 40 flips to
+   `gts(b5,b8)`, 23% slower than `rn(4,b10)`. Radix 2 over an odd base still looks too cheap. The
+   in-place path's closing `copy_from_slice`, a `2*len` sequential pass plus a `memcpy` call, is not
+   charged either and is the first thing to try.
+2. **The worst cases are now other defects.** f64 is 683 at 0.751, Rader's against Bluestein's,
+   which was 0.748 before and hidden behind 14. f32 is 765 at 0.909.
+3. **A handful of new f64 losses are RadixN inside the fixed planner's pick**, such as
+   `rn(2,bs(431,..))` or `rn(2,mr(b11,..))`, which got faster while the model stayed on a recipe
+   without RadixN. Nine of them at 5, mostly 2 to 5%; 6 recovers four, and 578, 722, 814, 902 and
+   946 remain.
+4. **Every `rn` timing in a dump or sweep taken before 415a29f is stale.** That includes all NEON
+   dumps, `dump_sse_f64`, `dump_sse_f32` and every sweep file without `fix` in its name. NEON
+   weights are unaffected since `radixn_extra` is 0 there, but its sweeps would need re-running
+   before being quoted again.
+
+Reproduce on the ThinkCentre:
+
+```sh
+./target/release/planner_tuning dump --planner sse [--f32] --rounds 7 --cap 48 \
+    --out dump_sse_fix_f64.tsv <the 33 lengths>
+./target/release/planner_tuning sweep --planner sse --backend sse --strided 1.5 1..1000
+./target/release/planner_tuning sweep --planner sse --backend sse --f32 --strided 2.5 1..1000
+```
+
 ## Update, 2026-09-16: the Pi 5 sweep, and what is per machine
 
 The measurement "The blocker, restated" below asks for. Raspberry Pi 5, Cortex-A76, governor
@@ -69,8 +162,8 @@ swept on the M1, the Pi 5 and the ThinkCentre (SSE, with that backend's usual `s
 **The default is now 30 for f64 and 45 for f32, the same on both backends.** At 30, f64 has fewer
 losses than 45 on every machine, for 0.2% of geomean on the M1. f32 at 45 is at or near the best
 on all three. The worst column barely depends on this weight: the ThinkCentre's and the M1's worst
-cases are the short-length `rn(k,b7)` defect at 14 and 28. Why f32 wants the larger value is not
-understood.
+cases are the short-length `rn(k,b7)` defect at 14 and 28 (since fixed in the library, see the
+RadixN update above). Why f32 wants the larger value is not understood.
 
 An explicit `--rader-index` still overrides the default. The default is `-1.0` in `Params`,
 resolved per element type by `CountedModel::rader_index`, the same idiom as `mul_complex`. So sweep
@@ -538,8 +631,8 @@ Delivers a deleted constant and a measurable win, with no plan-time cost and no 
 In rough order of how much each would change the picture.
 
 1. **A third machine.** The two in hand sit on the diagonal of {ARM, x86} x {strong, weak memory},
-   so instruction set and memory system are perfectly confounded. `radixn_extra = 5` is the largest
-   single term, worth 1.654 -> 1.152 on SSE, and is justified as an instruction-set property
+   so instruction set and memory system are perfectly confounded. `radixn_extra` (5 then, 6 and 1
+   since the RadixN fix) is the largest single term, worth 1.654 -> 1.152 on SSE, and is justified as an instruction-set property
    (16 xmm registers against 32 v) but fitted on one x86 machine.
    - **ryzen250, Zen 5**: same 16 xmm registers, strong memory system. Tests whether the register
      story is really the register story or just Coffee Lake's scheduler. Its recorded noise is not
