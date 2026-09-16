@@ -527,6 +527,31 @@ at 77, strictly worse at 13.
 The op counts are load-bearing, not decoration: scoring NEON data with SSE's counts degrades
 worst-case from 1.043 to 1.246.
 
+### The floor, if one weight set had to serve every backend
+
+Measured 2026-09-16, pure replay over the four 33-length dumps. A single memory weight set gridded
+jointly against all four, allowing only `radixn_extra` to differ per backend since that one is a
+register-file property and is known at compile time. Best joint set: `strided 1.5, permuted 2.5,
+rader-index 45, radixn_extra 0 on NEON and 5 on SSE`, cache levels irrelevant as always.
+
+| dataset | one shared set | own weights | fixed planner |
+|---|---|---|---|
+| NEON f64 | 1.003 / 1.043 | 1.003 / 1.043 | 1.093 / 1.495 |
+| NEON f32 | 1.032 / 1.225 | 1.032 / 1.121 | 1.171 / 1.969 |
+| SSE f64 | 1.085 / 1.323 | 1.052 / 1.152 | 1.246 / 1.734 |
+| SSE f32 | 1.052 / 1.250 | 1.034 / 1.121 | 1.207 / 1.927 |
+
+Three of the four then miss the 20% target, so this is not a proposal, and it supersedes the older
+figure quoted in the f32-on-SSE section below, which gridded a coarser set. The point is the floor:
+even forced onto one set the model beats the fixed planner on mean and worst on every dataset, and
+NEON f64 loses nothing at all. Getting the weights wrong degrades the result rather than inverting
+it.
+
+This is also the wrong axis to worry about. Each dataset is one (machine, backend, element type)
+cell and all three are confounded, so nothing here distinguishes "the NEON weights" from "the M1
+weights". Per-backend weights cost nothing to ship; per-machine weights cannot be shipped as
+constants at all. Only a second machine on the same backend separates the two.
+
 A note on the wasm row. `Backend::parse` knows only `neon` and `sse`, so the wasm dump silently fell
 back to the NEON counts, and it scores better that way (1.055) than with SSE's (1.153) despite wasm
 SIMD having no FMA. That is not luck: V8 compiles wasm SIMD **to NEON machine code** on an M1, so
@@ -545,14 +570,25 @@ candidate set and cost every member.
 | 100800 | 580 us | 0.5 us | 585 us | 1.0x |
 | 1000000 | 9.4 ms | 0.4 us | 556 us | 0.06x |
 
-That is 20x to 1265x the fixed planner's plan time, around 540x on average. In absolute terms it is
-0.02 to 0.6 ms, which is irrelevant for RustFFT's normal plan-once-run-many usage but costs tens of
-executions for a one-shot small transform. The measurement is pessimistic: it builds a fresh planner
-per repetition, so no inner recipe is memoised.
+That is 20x to 1265x the fixed planner's plan time, around 540x on average. The measurement is
+pessimistic: it builds a fresh planner per repetition, so no inner recipe is memoised.
 
-This is the strongest argument for the scoped form of the idea over the full estimating planner: a
-two-candidate comparison at one decision point costs almost nothing, while enumerating 48 candidates
-costs this.
+**The fixed planner's plan time is the wrong denominator, though.** What a caller pays is plan plus
+build, and building is 113x planning overall, because Rader's and Bluestein's each run a full inner
+FFT inside their constructors. Medians of three on the M1, `--cap 48`, 2026-09-16:
+
+| len | fixed plan | plan+price | build | extra on plan+build | in FFT executions |
+|---|---|---|---|---|---|
+| 1260 | 0.6 us | 62.5 us | 8.0 us | +720% | ~12 |
+| 10080 | 0.5 us | 138 us | 63 us | +219% | ~3 |
+| 100800 | 0.5 us | 284 us | 537 us | +53% | ~0.5 |
+
+So the honest cost is about twelve executions of the transform being planned at the worst measured
+length, three at 10k, under one above 100k, and zero at butterfly lengths and powers of two where
+enumeration short-circuits. Against a 5 to 25% gain on every execution thereafter that is an easy
+trade for anything but a genuine one-shot, which is what makes the full estimating planner
+defensible as a default rather than only the scoped form. Memoising inner recipes across candidates
+is the obvious optimisation and has deliberately not been done.
 
 ## f32 on NEON
 

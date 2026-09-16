@@ -4,6 +4,150 @@ Written 2026-09-11, at the end of the spike that produced `RESULTS.md`. That doc
 evidence; this one is the plan. Read `RESULTS.md` first for numbers, and `OP-COUNTS.md` for how the
 instruction counts were derived.
 
+## Update, 2026-09-16: target is upstream, and the scope is fixed
+
+A direction decision, which supersedes the Track A versus Track B framing further down. **The aim
+is the full estimating planner, prepared for inclusion in RustFFT.** The scoped form is no longer a
+competing track: it falls out of the full one for free if it is ever wanted separately, so there is
+no reason to build it first.
+
+Scope, decided:
+
+- **AVX is out.** There is no AVX tuner (`adapters.rs` instantiates NEON, SSE and wasm only) and no
+  AVX arm in `Backend`. AVX has its own algorithm set and is a separate project. This costs nothing
+  structurally: `FftPlanner` is an enum dispatching to five independent backend planners, each with
+  its own `plan_fft`, so NEON, SSE and wasm can adopt estimating planning while AVX keeps exactly
+  the planner it has today. "Default" therefore means default on the three covered backends.
+- **Default rather than opt-in, on the evidence below.** Not yet final.
+- **Simplifying the fixed planner toward cheap construction is coupled to that** and must not
+  happen first. See below.
+
+### Why default rather than opt-in
+
+The "20x to 1265x the fixed planner" number is true and is the wrong comparison. A caller pays plan
+plus build, and build is 113x plan. Against plan-plus-build the estimating planner costs about
+twelve executions of the transform it is planning at len 1260, three at 10080, under one at 100800,
+and nothing at all at butterfly lengths and powers of two where enumeration short-circuits. The
+table is in `RESULTS.md`. Against a 5 to 25% gain per execution thereafter that is an easy trade for
+anything except a genuine one-shot, and an opt-in planner is one almost nobody enables.
+
+### The fixed planner question, and why it is second
+
+If the fixed planner stays the default entry point and is simplified to prefer recipes that are
+quick to construct, every existing user silently gets slower transforms. That is a regression, not a
+simplification. Only once the estimating planner is the default does the fixed planner's job
+genuinely become "minimise plan plus build plus one execution", and preferring cheap constructors
+becomes the right objective for it rather than a compromise. It would also let
+`MAX_RADER_PRIME_FACTOR` go, since the estimating planner takes over the execution-speed judgement
+that constant currently makes badly.
+
+**One measurement is missing before committing to it.** Build cost has never been broken down by
+algorithm. The assumption is that Rader's and Bluestein's constructors dominate, since both run a
+full inner FFT during construction, and the 113x build-over-plan ratio is consistent with that. But
+until it is measured there is no way to know whether a construct-fast planner has anything
+meaningful to choose between.
+
+### 2026-09-16: a construction-aware planner has nothing to win
+
+This follows from the constructors, and did not need measuring. Build cost per algorithm, read off
+`src/algorithm/`:
+
+| algorithm | construction work |
+|---|---|
+| butterfly | a few hardcoded twiddles, O(1) |
+| `GoodThomas` | an integer CRT index map, **no trig at all** |
+| `MixedRadix` | `len` `compute_twiddle` calls |
+| `Radix4` / `RadixN` | one twiddle per element per layer, O(len) trig summed |
+| `Raders` | build inner + `len` trig + **one full execution of the inner FFT** |
+| `Bluesteins` | build inner + `2*len` trig + **one full execution of the inner FFT**, whose length is at least `2*len - 1` |
+
+**Only Rader's and Bluestein's contain an execute term**, and that is the whole gap: everyone else is
+one transcendental per element, while those two run a complete FFT inside `new()`. It is right there
+in both constructors as a `inner_fft.process_with_scratch(...)` call. `GoodThomasAlgorithm` is the
+cheapest of all to construct because it precomputes no twiddles whatsoever, only an index map, and
+the source even says so at `good_thomas_algorithm.rs:398`.
+
+The structural consequence is that **construction cost and choice are anti-correlated**, and this too
+is readable rather than measurable. Rader's and Bluestein's arise only where a prime factor has no
+butterfly. At such a length every candidate must handle that prime the same way, so the candidate
+list collapses to seven or nine entries that all carry the same expensive constructor. Where there
+is real choice, a smooth composite with two dozen or more candidates, no candidate contains an
+execute term at all, so every build cost is O(len) trig and they differ only by a constant factor.
+
+Two corrections to how this was framed earlier in the day:
+
+1. Rader's and Bluestein's are reached from prime **factors**, not only from prime lengths. Every
+   candidate at 2018, which is 2 x 1009, nests a Rader's.
+2. Twiddle-only recipes are cheap but not equal: GoodThomas does zero trig where RadixN does one per
+   element per layer. "Only Rader's and Bluestein's cost anything to construct" is right about the
+   order of magnitude and wrong about the spread.
+
+The one quantity the source does not give is the crossover, because it depends on the ratio of a
+trig call to an FFT execution. `crossover` measures it: it builds and times every candidate and
+reports the minimiser of `build + k * execute`. NEON f64 on the M1, as confirmation only:
+
+| len | k=1 winner | model's pick | crossover |
+|---|---|---|---|
+| 1260 | `gt(b9,rn(5.4,b7))`, build 2.4 us | `rn(7.6.2,b15)`, build 7.7 us | 4 executions |
+| 1009 | `rad(rn(7.6,b24))` | same | nothing to choose |
+| 2018 | `gt(b2,rad(rn(7.6,b24)))` | `rn(2,rad(...))` | 3 executions |
+| 1013 | `rad(rn(4,gts(b11,b23)))` | `bs(1013,r4(3,b32))` | 6 executions |
+| 3001 | `rad(rn(5.5.5,b24))` | same | nothing to choose |
+| 9973 | `bs(9973,rn(4.4.4.4.4.4,b5))` | same | nothing to choose |
+
+Three to six executions, and nothing to choose at half the lengths.
+
+**Consequence: drop the construction-aware planner, and drop simplifying the fixed planner toward
+cheap construction.** Neither can win more than a few microseconds, and only for a transform used
+once or twice. It also reframes what a one-shot caller should avoid: at 1260 the estimating planner's
+own enumeration costs 62 us while the best available build-cost saving is 3.8 us, so the thing to
+skip for one-shot use is the *pricing*, not the recipe. That escape hatch already exists and is the
+current fixed planner, unmodified. No third planner, and nothing new to build.
+
+### Recipe caching: already there, and it is what makes the recursive version affordable
+
+All four planners already cache recipes by length: `recipe_cache: HashMap<usize, Arc<Recipe>>`,
+checked at the top of `design_fft_for_len`, with `test_scalar_recipe_cache` guarding it. The
+prototype already hits it, because `candidates_inner` gets every inner recipe through
+`planner.plan(len)`.
+
+So three things, in increasing order of interest.
+
+1. **The plan-time numbers are cold-start figures.** `cmd_plantime` constructs a fresh `P::new()`
+   inside the timing loop precisely to defeat both caches, so 62 us at 1260 is a per-length worst
+   case rather than a steady state. A session planning many lengths shares divisors heavily.
+
+2. **The enumeration is only one level deep today.** `candidates_inner` enumerates top-level splits
+   but takes each inner factor's recipe from the fixed planner, at `src/tuning/mod.rs:366`. That is
+   exactly why regret is described throughout `RESULTS.md` as a lower bound: the inners are never
+   optimised, only the outermost decomposition. Memoising the *estimating* planner's own answer per
+   length is what lets it recurse, turning the whole thing into dynamic programming over the divisor
+   lattice, which is what FFTW's MEASURE does. The set of lengths visited stays small: divisors of
+   `n`, plus the inner lengths Rader's and Bluestein's introduce.
+
+3. **Keying that cache on length alone is sound, but only because of a measured property.**
+   `cost_ws` threads the *enclosing* transform's working set down to every nested node, and `ws`
+   enters the cost solely through `mem()`'s choice of cache level. So in principle the best recipe
+   for length 34 inside a 100000-point transform need not be the best standalone recipe for 34, and
+   a length-keyed cache would be wrong. It is not wrong, because the cache-level term is inert:
+   collapsing L1/L2/DRAM to a single flat cost changes no pick at any length, in cache or out, which
+   makes the cost completely independent of `ws` and the best recipe a pure function of the length.
+
+   **This is a constraint on future changes, not just an observation.** If the cache-level term is
+   ever made load-bearing, memoising recipes by length silently becomes incorrect, and the failure
+   would be a subtly wrong inner recipe rather than anything that trips a test. Anyone reviving the
+   cache-size machinery has to key the recipe cache on the working set as well, or give it up.
+
+### The blocker, restated
+
+Not NEON versus SSE. Every NEON number comes from the M1 and every SSE number from the ThinkCentre,
+so backend and machine are the same column of data. Per-backend weights are compile-time constants
+and cost nothing to ship; per-machine weights cannot be shipped as constants at all. **A second
+machine on the same backend, the Pi 5, is what separates those two worlds**, which promotes it from
+a nice-to-have to the measurement the shipping decision rests on. The floor if one set had to serve
+everything is now measured and is in `RESULTS.md`: still better than the fixed planner on every
+dataset, but three of four miss the 20% target.
+
 ## Update, 2026-09-15: the crossover term, and a bigger dataset
 
 Nothing below this section is retracted, but two numbers in `RESULTS.md` are stale and one

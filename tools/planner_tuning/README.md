@@ -83,6 +83,15 @@ fraction of plan-plus-build at small lengths and a small one at large lengths.
 Single plan-time measurements are noisy, up to 1.6x apart at length 1200. Take medians of three.
 The candidate counts it prints are exact.
 
+`crossover` goes further and asks which recipe would win if construction cost counted: it builds and
+times every candidate, then reports the minimiser of `build + k * execute` at several `k`, plus how
+many executions the cost model's pick needs to repay its extra build cost. Measured answer is three
+to six, so this mostly documents why a construction-aware planner is not worth building.
+
+```sh
+./target/release/planner_tuning crossover --planner neon --cap 24 1260 1009 2018
+```
+
 ## Two candidate sets, deliberately
 
 - `candidates` / `candidates_capped` are **exhaustive**: every split in both orders, every
@@ -131,6 +140,9 @@ the SSE planner.
 
 ## The documents
 
+- `COST-MODEL.md` is how the estimating planner works: what a cost is, how one is computed, which
+  numbers are counted and which are fitted, and what has to be redone when a kernel changes. Start
+  here.
 - `RESULTS.md` is the evidence: how the cost model was built and what it scores.
 - `OP-COUNTS.md` is where the instruction counts come from.
 - `NEXT-STEPS.md` is the live plan, and the place new findings get written down.

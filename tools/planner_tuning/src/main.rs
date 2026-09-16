@@ -996,6 +996,109 @@ fn cmd_costs(path: &str, opts: &Options) {
 /// inner FFT inside their constructors. So the question that decides whether an estimating
 /// planner is affordable is not how much slower it is than the fixed planner, but how much it
 /// adds to plan-plus-build, which is what a caller actually pays before the first transform.
+/// How the best recipe changes once construction cost is counted, which is the question a
+/// quick-and-dirty planner for one-shot transforms exists to answer.
+///
+/// For every candidate this measures build time and execution time, then reports which recipe
+/// minimises `build + k * execute` at several values of `k`. If the same recipe wins at every `k`
+/// there is nothing for a construction-aware planner to choose, and the idea is dead. Plan time is
+/// deliberately excluded: it is the same constant for every candidate at one length, so it cannot
+/// change which recipe wins.
+fn cmd_crossover<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
+    let model = counted::CountedModel::new(opts.params);
+    println!(
+        "{:>7} {:>6} {:>6} {:>11} {:>11} {:>12}  {}",
+        "len", "cands", "k", "build ns", "exec ns", "total ns", "recipe"
+    );
+
+    for &len in lengths {
+        let mut planner = P::new();
+        let specs = plan_candidates(&mut planner, len, opts.cap);
+        if specs.is_empty() {
+            eprintln!("len {}: no candidates", len);
+            continue;
+        }
+
+        let mut subjects: Vec<Subject<T>> = specs
+            .iter()
+            .map(|spec| {
+                let fft = planner.build(spec, FftDirection::Forward);
+                Subject::new(to_spec_string(spec), fft, 1)
+            })
+            .collect();
+        measure(&mut subjects, opts.rounds, opts.block_ms);
+        let exec: Vec<f64> = subjects.iter().map(|s| s.best()).collect();
+
+        // A fresh planner per repetition, so no inner FFT is served from a cache.
+        let build_reps = if len > 4096 { 5 } else if len > 256 { 20 } else { 100 };
+        let build: Vec<f64> = specs
+            .iter()
+            .map(|spec| {
+                let t = Instant::now();
+                for _ in 0..build_reps {
+                    let mut pl = P::new();
+                    std::hint::black_box(pl.build(spec, FftDirection::Forward));
+                }
+                t.elapsed().as_secs_f64() * 1e9 / build_reps as f64
+            })
+            .collect();
+
+        let pick = |k: f64| -> usize {
+            (0..specs.len())
+                .min_by(|&a, &b| {
+                    (build[a] + k * exec[a])
+                        .partial_cmp(&(build[b] + k * exec[b]))
+                        .unwrap()
+                })
+                .unwrap()
+        };
+
+        let mut first = true;
+        for k in [1.0, 10.0, 100.0, 1000.0] {
+            let i = pick(k);
+            println!(
+                "{:>7} {:>6} {:>6} {:>11.0} {:>11.1} {:>12.0}  {}",
+                if first { len.to_string() } else { String::new() },
+                if first { specs.len().to_string() } else { String::new() },
+                k as usize,
+                build[i],
+                exec[i],
+                build[i] + k * exec[i],
+                subjects[i].name
+            );
+            first = false;
+        }
+
+        // What the counted model picks, which optimises execution alone.
+        let mi = specs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sp)| model.cost(sp).map(|c| (i, c)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let one = pick(1.0);
+        println!(
+            "{:>7} {:>6} {:>6} {:>11.0} {:>11.1} {:>12}  {}",
+            "", "", "model", build[mi], exec[mi], "", subjects[mi].name
+        );
+        // Crossover: how many executions before the model's pick repays its extra build cost.
+        if one != mi && exec[mi] < exec[one] {
+            let k = (build[mi] - build[one]) / (exec[one] - exec[mi]);
+            println!(
+                "{:>7} {:>6} {:>6} {:>11} {:>11} {:>12}  model repays its build cost after {:.0} executions",
+                "", "", "", "", "", "", k.max(0.0)
+            );
+        } else if one == mi {
+            println!(
+                "{:>7} {:>6} {:>6} {:>11} {:>11} {:>12}  same recipe at k=1 and by cost model: nothing to choose",
+                "", "", "", "", "", ""
+            );
+        }
+        println!();
+    }
+}
+
 fn cmd_plantime<T: FftNum, P: TunablePlanner<T>>(lengths: &[usize], opts: &Options) {
     let model = counted::CountedModel::new(opts.params);
     println!(
@@ -1217,6 +1320,7 @@ enum Command {
     Explain(String),
     Costs(String),
     Plantime(Vec<usize>),
+    Crossover(Vec<usize>),
     Sweep(Vec<usize>),
 }
 
@@ -1238,6 +1342,7 @@ fn run<T: FftNum + ToPrimitive, P: TunablePlanner<T>>(
         Command::Explain(spec) => cmd_explain(spec, opts),
         Command::Costs(path) => cmd_costs(path, opts),
         Command::Plantime(l) => cmd_plantime::<T, P>(l, opts),
+        Command::Crossover(l) => cmd_crossover::<T, P>(l, opts),
     }
 }
 
@@ -1377,6 +1482,7 @@ fn main() {
         "explain" => Command::Explain(rest[0].clone()),
         "costs" => Command::Costs(rest[0].clone()),
         "plantime" => Command::Plantime(numbers(&rest)),
+        "crossover" => Command::Crossover(numbers(&rest)),
         "model" => {
             let lengths = numbers(&rest);
             let split = lengths
