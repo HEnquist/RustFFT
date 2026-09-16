@@ -4,6 +4,96 @@ Written 2026-09-11, at the end of the spike that produced `RESULTS.md`. That doc
 evidence; this one is the plan. Read `RESULTS.md` first for numbers, and `OP-COUNTS.md` for how the
 instruction counts were derived.
 
+## Update, 2026-09-16: the Pi 5 sweep, and what is per machine
+
+The measurement "The blocker, restated" below asks for. Raspberry Pi 5, Cortex-A76, governor
+`performance`, pinned to one core. Both sweeps on this branch's code, and the M1 re-swept on the
+same code (`sweep_m1_*`), which reproduces the `_bs` runs to 0.001 and so confirms the enumeration
+pruning since then changed no decision. A replicate Pi run gives per-length noise of 0.2% median,
+0.7% p90, and the same geometric mean to 0.001, so every difference below is real.
+
+| | M1 f64 | Pi f64 | M1 f32 | Pi f32 |
+|---|---|---|---|---|
+| geomean planner/model | 1.0218 | 1.0059 | 1.2155 | 1.1460 |
+| model wins beyond 2% | 158 | 122 | 641 | 633 |
+| model loses beyond 2% | 54 | **116** | 88 | 91 |
+
+Same backend, same code, so the model's pick is identical at all 1000 lengths on both machines and
+only the timing differs. Grouping the disagreements by planner and model algorithm, **every class
+lands within 1.5% of the M1 except the ones deciding Rader's versus Bluestein's**. In f64,
+`rn(..rad..) -> bs` loses at 71 of 86 lengths on the Pi against 27 on the M1, and `rad -> bs` at 20
+of 23 against 4. In f32 the model mostly wins those same classes, but by about 12% less on the Pi.
+A smaller secondary shift is `mrs -> rn`, where the model's win is 7% (f64) and 11% (f32) smaller.
+
+### `rader_index` is a per-machine weight
+
+Dumps at the 27 small primes and at 17 composites with a Rader's factor, taken from the Pi's sweep
+losses, on both machines. Mean / worst regret by replay:
+
+| `rader_index` | M1 small primes | M1 composites | Pi small primes | Pi composites |
+|---|---|---|---|---|
+| 30 | 1.0257 / 1.1519 | 1.0396 / 1.1476 | **1.0000 / 1.0000** | **1.0006 / 1.0099** |
+| 36 | 1.0155 / 1.1434 | 1.0234 / 1.1213 | 1.0082 / 1.1283 | 1.0060 / 1.0605 |
+| 40 | **1.0109 / 1.0983** | **1.0076 / 1.0588** | 1.0267 / 1.2148 | 1.0632 / 1.2730 |
+| 45 | 1.0183 / 1.0983 | 1.0251 / 1.1051 | 1.0840 / 1.3154 | 1.1861 / 1.2730 |
+
+The optima do not overlap: 25 to 30 on the Pi, 40 on the M1. This fits how 45 was derived, from
+about 10 cycles of chain latency converted into instruction slots at the M1's instructions per
+cycle. A narrower core retires fewer per cycle, so the same latency is worth fewer slots. 30 would
+mean about 3 per cycle on the A76, which is plausible but not measured.
+
+A side result: the M1 composites want 40, not 45, because the 40 to 52 window was fitted on primes
+only. The replay above pointed at 36 as the best shared value. The full sweeps below overrule it,
+since they cover all 1000 lengths rather than 44 hand-picked ones.
+
+### Resolved: one default per precision, acceptable on all three machines
+
+The goal is weights that are acceptable on every machine, not optimal on any one. `rader_index`
+swept on the M1, the Pi 5 and the ThinkCentre (SSE, with that backend's usual `strided` and
+`radixn_extra`). Geomean planner/model / losses beyond 2% / worst:
+
+| f64 | M1 | Pi 5 | ThinkCentre |
+|---|---|---|---|
+| **30** | 1.0196 / 33 / 0.841 | 1.0202 / 28 / 0.921 | 1.0252 / 46 / 0.657 |
+| 36 | 1.0207 / 32 / 0.847 | 1.0194 / 45 / 0.880 | 1.0282 / 45 / 0.669 |
+| 40 | 1.0218 / 32 / 0.845 | 1.0166 / 53 / 0.787 | 1.0314 / 40 / 0.645 |
+| 45 | 1.0218 / 54 / 0.850 | 1.0059 / 116 / 0.739 | 1.0330 / 54 / 0.658 |
+
+| f32 | M1 | Pi 5 | ThinkCentre |
+|---|---|---|---|
+| 30 | 1.1607 / 90 / 0.714 | 1.1184 / 91 / 0.817 | 1.1371 / 37 / 0.652 |
+| 36 | 1.1905 / 88 / 0.659 | 1.1355 / 87 / 0.855 | 1.1590 / 38 / 0.624 |
+| **45** | 1.2147 / 88 / 0.781 | 1.1455 / 91 / 0.845 | 1.1731 / 36 / 0.646 |
+| 55 | 1.2163 / 88 / 0.785 | 1.1461 / 95 / 0.794 | 1.1760 / 43 / 0.643 |
+
+**The default is now 30 for f64 and 45 for f32, the same on both backends.** At 30, f64 has fewer
+losses than 45 on every machine, for 0.2% of geomean on the M1. f32 at 45 is at or near the best
+on all three. The worst column barely depends on this weight: the ThinkCentre's and the M1's worst
+cases are the short-length `rn(k,b7)` defect at 14 and 28. Why f32 wants the larger value is not
+understood.
+
+An explicit `--rader-index` still overrides the default. The default is `-1.0` in `Params`,
+resolved per element type by `CountedModel::rader_index`, the same idiom as `mul_complex`. So sweep
+headers now print `rader_index: -1.0` and the `elem` field decides.
+
+The first ThinkCentre grid ran 3.3x slow under a runaway `plasmashell` and was discarded. The
+numbers above are the re-run, which reproduces the 2026-09-15 sweep at 45 to within 0.4% of geomean.
+
+### Bluestein's working set, which the model cannot express
+
+At 100003 and 100049 on the Pi both the model and the fixed planner pick Bluestein's, and Rader's is
+**3.2x and 2.9x faster** (16 ms against 47 to 101 ms for every Bluestein's variant). The M1 is
+within 5% at the same picks. The inner is 262144 points, 4 MB of complex f64: inside the M1's L2,
+far outside anything the A76 has.
+
+No weight fixes it. Setting `l1_elems`/`l2_elems` to the Pi's sizes and gridding `seq-dram` from 6
+to 30 changes neither pick, because `cost_ws` charges Bluestein's inner FFT and its padded pass at
+the *outer* length's working set. Every candidate at a length therefore gets the same cache level,
+which is also why the level term was inert on the M1. Charging the Bluestein's node at its own inner
+length is the obvious fix, and it keeps a node's cost a function of its own subtree, so it does not
+break the length-keyed memoisation argument under "Recipe caching". Not tried yet. The 1..1000
+sweep cannot see any of this, so a large-length sweep on the Pi is the way to size it.
+
 ## Update, 2026-09-16: target is upstream, and the scope is fixed
 
 A direction decision, which supersedes the Track A versus Track B framing further down. **The aim

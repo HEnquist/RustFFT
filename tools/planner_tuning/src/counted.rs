@@ -181,20 +181,26 @@ pub struct Params {
     /// **Size it from the latency, not the instruction count.** The carried chain is
     /// `mul -> umulh -> mul -> sub`, which is about 10 cycles on both an M1 firestorm core and
     /// Coffee Lake. Ten cycles of a core that retires 4 to 6 instructions per cycle is 40 to 60
-    /// instruction slots, so the weight belongs near 45, not near the 7 instructions counted.
-    /// The old default of 20 assumed a 3x latency inflation and was too small by a factor of two.
+    /// instruction slots, not the 7 instructions counted. The first default of 20 assumed a 3x
+    /// latency inflation and got 12 of 54 prime lengths wrong, at up to 1.64x.
     ///
-    /// The old value survived only because the original 33 lengths were all 1000 or larger and
-    /// held no small primes. The term is linear in `len` while everything around it grows as
-    /// `len log len`, so at the old weight it was 31% of a Rader's cost at len 1009 and 7% at
-    /// len 100003, and at 45 it is 50% and 15%: exactly the lengths the first dataset could not
-    /// see are the ones that pin it down. On the
-    /// extended set it decides the Rader's-versus-Bluestein's call at 59, 233, 373, 1013 and 1021.
+    /// The term is linear in `len` while everything around it grows as `len log len`, so it
+    /// matters most at small lengths, which is why the original 33 lengths (all 1000 or larger)
+    /// could not pin it down. It decides the Rader's-versus-Bluestein's call.
     ///
-    /// Over all 54 prime lengths in the five NEON and SSE datasets, the family call is right at
-    /// 52 to 54 of them for anything in 40 to 52, and every miss inside that window is a near-tie
-    /// costing at most 3.3%. 45 is the only value that takes all 54. Outside it the errors are
-    /// real: 20 gets 12 wrong, at up to 1.64x, and 55 gets 4.
+    /// **It is not one value per machine, so the default is a compromise across machines.** Slots
+    /// per cycle depend on the core, and the optimum moves with it: 40 on the M1 and 25 to 30 on a
+    /// Cortex-A76. The default is chosen by the 1..1000 sweep on the M1, the Pi 5 and the
+    /// ThinkCentre, to be acceptable on all three rather than optimal on one:
+    ///
+    /// - f64: **30**. Fewer losses beyond 2% than 45 on every machine (33/28/46 against
+    ///   54/116/54), for 0.2% of geometric mean on the M1.
+    /// - f32: **45**. At or near the best on all three; 30 costs 2 to 4% of geometric mean.
+    ///
+    /// Why f32 wants a larger value is not understood. `complex_per_vector` already halves the
+    /// arithmetic per element while this chain stays per element.
+    ///
+    /// Negative means "use that per-element default"; see `CountedModel::rader_index`.
     pub rader_index: f64,
     /// Cost of one spilled vector per unrolled group in a RadixN cross layer, as a store plus a
     /// reload. Zero disables the register-pressure term entirely.
@@ -319,7 +325,7 @@ impl Default for Params {
             seq: [1.0, 2.0, 6.0],
             strided_mult: 1.5,
             permuted_mult: 2.5,
-            rader_index: 45.0,
+            rader_index: -1.0,
             spill: 0.0,
             radixn_extra: 0.0,
             mul_complex: -1.0,
@@ -347,6 +353,18 @@ impl CountedModel {
             self.params.mul_complex
         } else {
             self.params.backend.mul_complex(self.params.elem)
+        }
+    }
+
+    /// The Rader's index cost actually in force. See `Params::rader_index` for the values.
+    fn rader_index(&self) -> f64 {
+        if self.params.rader_index >= 0.0 {
+            self.params.rader_index
+        } else {
+            match self.params.elem {
+                Elem::F64 => 30.0,
+                Elem::F32 => 45.0,
+            }
         }
     }
 
@@ -500,7 +518,7 @@ impl CountedModel {
                 let mut c = 2.0 * self.cost_ws(inner, ws)?;
                 // Two permutation passes, each a scatter or gather whose index comes from a
                 // serial modular-multiply chain rather than from a table.
-                c += 2.0 * (self.mem(2.0 * len, Pattern::Permuted, ws) + len * p.rader_index);
+                c += 2.0 * (self.mem(2.0 * len, Pattern::Permuted, ws) + len * self.rader_index());
                 c += len * self.mul_complex() + self.mem(2.0 * len, Pattern::Sequential, ws);
                 c
             }
