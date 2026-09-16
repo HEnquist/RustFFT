@@ -430,7 +430,7 @@ macro_rules! simd_adapter {
             fn radixn_bases() -> Vec<usize> {
                 // `SimdRadixN` only asserts a whole number of vectors in the base, so for f64
                 // every base is legal and for f32 the odd ones are not.
-                let multiple = crate::simd_planner::complex_per_vector::<T>();
+                let multiple = crate::simd::simd_planner::complex_per_vector::<T>();
                 SIMD_RADIXN_BASES
                     .iter()
                     .copied()
